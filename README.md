@@ -1,6 +1,6 @@
 # Music Audio Cleaner
 
-Automatically censors or replaces specific words in songs while preserving the original singer's voice.
+Automatically censors or replaces specific words in songs while attempting to preserve the original singer's voice.
 
 ## How it works
 
