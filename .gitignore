@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+*.pyo
+checkpoints/
+demucs_output/
+*.mp3
+*.wav
+.claude/

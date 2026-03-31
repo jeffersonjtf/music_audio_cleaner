@@ -1,0 +1,6 @@
+openai-whisper
+pydub
+demucs
+soundfile
+TTS
+seed-vc
