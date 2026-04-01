@@ -529,6 +529,104 @@ def _snap_to_onset(vocals_np, sr, timestamp_s, window_s=0.25):
     return snapped_s
 
 
+def _verify_replacement(vocals_after, mute_start_ms, mute_end_ms, sr, context_s=2.0):
+    """Compare the replaced section against the 2s of audio before and after it.
+    Reports RMS energy ratio, spectral centroid drift, and splice-point continuity.
+    Returns a dict of metrics and a PASS/WARN verdict for each."""
+    import librosa
+
+    # Extract numpy audio from the modified AudioSegment
+    raw = np.array(vocals_after.get_array_of_samples(), dtype=np.float32)
+    if vocals_after.channels == 2:
+        raw = raw.reshape(-1, 2).mean(axis=1)
+    raw /= (2 ** (vocals_after.sample_width * 8 - 1))
+
+    total_samples = len(raw)
+    frame_rate = vocals_after.frame_rate
+
+    ctx_samples  = int(context_s * frame_rate)
+    start_sample = int(mute_start_ms * frame_rate / 1000)
+    end_sample   = int(mute_end_ms   * frame_rate / 1000)
+
+    before_start = max(0, start_sample - ctx_samples)
+    after_end    = min(total_samples, end_sample + ctx_samples)
+
+    seg_before   = raw[before_start:start_sample]
+    seg_replaced = raw[start_sample:end_sample]
+    seg_after    = raw[end_sample:after_end]
+
+    results = {}
+
+    # --- 1. RMS energy ratio ---
+    def rms(x):
+        return float(np.sqrt(np.mean(x ** 2))) if len(x) > 0 else 0.0
+
+    rms_ctx = (rms(seg_before) + rms(seg_after)) / 2 + 1e-9
+    rms_rep = rms(seg_replaced)
+    rms_ratio = rms_rep / rms_ctx
+    results["rms_ratio"] = round(rms_ratio, 3)
+    results["rms_ok"] = 0.25 <= rms_ratio <= 4.0
+
+    # --- 2. Spectral centroid drift ---
+    def mean_centroid(x):
+        if len(x) < 512:
+            return None
+        return float(np.mean(librosa.feature.spectral_centroid(y=x, sr=frame_rate)))
+
+    c_before = mean_centroid(seg_before)
+    c_after  = mean_centroid(seg_after)
+    c_rep    = mean_centroid(seg_replaced)
+
+    if c_before and c_after and c_rep:
+        c_ctx = (c_before + c_after) / 2
+        centroid_drift = abs(c_rep - c_ctx) / (c_ctx + 1e-9)
+        results["centroid_drift_pct"] = round(centroid_drift * 100, 1)
+        results["centroid_ok"] = centroid_drift < 0.60  # >60% drift = warning
+    else:
+        results["centroid_drift_pct"] = None
+        results["centroid_ok"] = True  # too short to measure
+
+    # --- 3. Splice-point RMS continuity (50ms window either side of each cut) ---
+    snap_ms = 50
+    snap_samples = int(snap_ms * frame_rate / 1000)
+
+    pre_splice  = raw[max(0, start_sample - snap_samples):start_sample]
+    post_splice = raw[start_sample:start_sample + snap_samples]
+    splice_in_ratio = (rms(post_splice) / (rms(pre_splice) + 1e-9))
+
+    pre_out  = raw[max(0, end_sample - snap_samples):end_sample]
+    post_out = raw[end_sample:end_sample + snap_samples]
+    splice_out_ratio = (rms(post_out) / (rms(pre_out) + 1e-9))
+
+    results["splice_in_ratio"]  = round(splice_in_ratio,  3)
+    results["splice_out_ratio"] = round(splice_out_ratio, 3)
+    results["splice_ok"] = (0.1 <= splice_in_ratio  <= 10.0 and
+                            0.1 <= splice_out_ratio <= 10.0)
+
+    # --- Verdict ---
+    passed = results["rms_ok"] and results["centroid_ok"] and results["splice_ok"]
+    results["verdict"] = "PASS" if passed else "WARN"
+    return results
+
+
+def _print_verification(metrics, word):
+    verdict = metrics["verdict"]
+    tag = "✓" if verdict == "PASS" else "!"
+    print(f"    [{tag}] Verification for \"{word}\":")
+    rms_flag  = "" if metrics["rms_ok"]      else "  ← WARNING: replacement energy mismatch"
+    cent_flag = "" if metrics["centroid_ok"] else "  ← WARNING: timbral drift too high"
+    spl_flag  = "" if metrics["splice_ok"]   else "  ← WARNING: abrupt level jump at splice point"
+    print(f"        RMS ratio (replaced / context):  {metrics['rms_ratio']:.3f}  (ideal ≈ 1.0){rms_flag}")
+    if metrics["centroid_drift_pct"] is not None:
+        print(f"        Spectral centroid drift:         {metrics['centroid_drift_pct']:.1f}%  (ideal < 60%){cent_flag}")
+    print(f"        Splice-in  level continuity:     {metrics['splice_in_ratio']:.3f}  (ideal ≈ 1.0){spl_flag}")
+    print(f"        Splice-out level continuity:     {metrics['splice_out_ratio']:.3f}  (ideal ≈ 1.0){spl_flag}")
+    if verdict == "WARN":
+        print(f"        → Replacement may need review.")
+    else:
+        print(f"        → Replacement sounds integrated.")
+
+
 def find_target_words(words, target_pairs):
     """Find words in transcript that match target words."""
     replacements = []
@@ -643,7 +741,10 @@ def build_clean_audio(replacements, vocals_path, no_vocals_path, voice_sample_pa
 
         vocals = before + fade_out_zone + ducked_zone + fade_in_zone + after
         vocals = vocals.overlay(tts, position=mute_start)
-        print(f"    Done.")
+
+        # Self-verify: compare replaced section against 2s of surrounding context
+        metrics = _verify_replacement(vocals, mute_start, mute_end, vocals_sr)
+        _print_verification(metrics, r["replacement"])
 
     # Remix vocals + accompaniment
     print("\nRemixing vocals with accompaniment...")
