@@ -529,8 +529,14 @@ def _snap_to_onset(vocals_np, sr, timestamp_s, window_s=0.25):
     return snapped_s
 
 
-def _verify_replacement(vocals_after, mute_start_ms, mute_end_ms, sr, context_s=2.0):
+def _verify_replacement(vocals_after, mute_start_ms, mute_end_ms, sr,
+                        context_s=2.0, orig_word_np=None):
     """Compare the replaced section against 2s of surrounding audio on 9 axes.
+
+    orig_word_np: the original sung word as a numpy array (same sample rate as
+    vocals_after). When provided, F0 is verified against this specific note
+    rather than the 2s context window, which contains other melody notes and
+    would give a false F0 warning.
 
     Checks:
       1.  RMS energy ratio          — loudness match
@@ -539,7 +545,7 @@ def _verify_replacement(vocals_after, mute_start_ms, mute_end_ms, sr, context_s=
       4.  Splice-out RMS continuity — level jump at exit cut
       5.  ZCR discontinuity        — click/pop at splice edges
       6.  MFCC cosine distance      — voice/timbre identity match
-      7.  F0 pitch match            — is replacement in the song's key?
+      7.  F0 pitch match            — is replacement on the same note as original word?
       8.  Spectral rolloff match    — high-frequency brightness match
       9.  Chroma cosine similarity  — harmonic/musical key match
     """
@@ -633,6 +639,10 @@ def _verify_replacement(vocals_after, mute_start_ms, mute_end_ms, sr, context_s=
         results["mfcc_ok"]       = True
 
     # ------------------------------------------------------------------ 7. F0 pitch match
+    # Reference: the original word's isolated audio (same note as the replacement
+    # should be singing). The 2s context window spans multiple melody notes and
+    # would give a misleading average — a word can be correct while still being
+    # semitones away from the surrounding context's mean pitch.
     def mean_f0(x):
         if len(x) < 2048:
             return None
@@ -642,10 +652,10 @@ def _verify_replacement(vocals_after, mute_start_ms, mute_end_ms, sr, context_s=
         vf = f0[voiced & ~np.isnan(f0)] if f0 is not None else np.array([])
         return float(np.mean(vf)) if len(vf) > 0 else None
 
-    f0_ctx = mean_f0(seg_ctx)
+    f0_ref = mean_f0(orig_word_np) if orig_word_np is not None and len(orig_word_np) >= 2048 else mean_f0(seg_ctx)
     f0_rep = mean_f0(seg_replaced)
-    if f0_ctx and f0_rep:
-        semitones = abs(12.0 * np.log2(f0_rep / f0_ctx))
+    if f0_ref and f0_rep:
+        semitones = abs(12.0 * np.log2(f0_rep / f0_ref))
         results["f0_semitone_diff"] = round(float(semitones), 2)
         results["f0_ok"]            = semitones < 3.0  # >3 semitones = wrong note
     else:
@@ -847,8 +857,12 @@ def build_clean_audio(replacements, vocals_path, no_vocals_path, voice_sample_pa
         vocals = before + fade_out_zone + ducked_zone + fade_in_zone + after
         vocals = vocals.overlay(tts, position=mute_start)
 
-        # Self-verify: compare replaced section against 2s of surrounding context
-        metrics = _verify_replacement(vocals, mute_start, mute_end, vocals_sr)
+        # Self-verify: compare replaced section against 2s of surrounding context.
+        # Pass the original word audio so F0 is checked against that specific note,
+        # not the context window average (which spans many different melody notes).
+        orig_word_np = vocals_np[int(snapped_start * vocals_sr):int(snapped_end * vocals_sr)]
+        metrics = _verify_replacement(vocals, mute_start, mute_end, vocals_sr,
+                                      orig_word_np=orig_word_np)
         _print_verification(metrics, r["replacement"])
 
     # Remix vocals + accompaniment
@@ -900,6 +914,17 @@ def verify_only(mp3_path, words_path):
     print(f"Loading clean audio: {clean_mp3}")
     clean_audio = AudioSegment.from_mp3(str(clean_mp3))
 
+    # Load original vocals (cached by demucs) for word-accurate F0 reference
+    vocals_path = out_dir / "demucs_output" / mp3_path.stem / "vocals.wav"
+    vocals_np = None
+    vocals_sr = None
+    if vocals_path.exists():
+        import librosa
+        print(f"  Loading original vocals for F0 reference...")
+        vocals_np, vocals_sr = librosa.load(str(vocals_path), sr=None, mono=True)
+    else:
+        print("  (Original vocals not found — F0 check will use context window as fallback)")
+
     pad = 80  # ms — same as full pipeline
     print(f"\nVerifying {len(replacements)} replacement(s) against clean file...\n")
 
@@ -910,10 +935,15 @@ def verify_only(mp3_path, words_path):
         mute_start = max(0, start_ms - pad)
         mute_end   = min(len(clean_audio), end_ms + pad)
 
+        # Extract the original word audio for accurate F0 reference
+        orig_word_np = None
+        if vocals_np is not None:
+            orig_word_np = vocals_np[int(r["start"] * vocals_sr):int(r["end"] * vocals_sr)]
+
         print(f"  [{r['start']:.2f}s - {r['end']:.2f}s]  "
               f"\"{r['original']}\" -> \"{r['replacement']}\"")
         metrics = _verify_replacement(clean_audio, mute_start, mute_end,
-                                      clean_audio.frame_rate)
+                                      clean_audio.frame_rate, orig_word_np=orig_word_np)
         _print_verification(metrics, r["replacement"])
         if metrics["verdict"] != "PASS":
             all_pass = False
