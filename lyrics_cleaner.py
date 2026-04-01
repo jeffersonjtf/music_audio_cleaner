@@ -869,7 +869,9 @@ def build_clean_audio(replacements, vocals_path, no_vocals_path, voice_sample_pa
     print("\nRemixing vocals with accompaniment...")
     min_len = min(len(vocals), len(accompaniment))
     cleaned = accompaniment[:min_len].overlay(vocals[:min_len])
-    return cleaned
+    # Return the modified vocals-only track alongside the mix so callers can
+    # save it as a sidecar for --verify (F0 check needs isolated vocals, not the mix)
+    return cleaned, vocals
 
 
 def save_timestamps(words, path):
@@ -911,17 +913,26 @@ def verify_only(mp3_path, words_path):
         print("No target words found in cached timestamps.")
         return
 
-    print(f"Loading clean audio: {clean_mp3}")
-    clean_audio = AudioSegment.from_mp3(str(clean_mp3))
+    # Use isolated vocals sidecar for verification — the full mix contains
+    # instruments that corrupt pitch (F0) and timbre (MFCC) measurements.
+    vocals_clean_wav = out_dir / f"{stem}_vocals_clean.wav"
+    if vocals_clean_wav.exists():
+        print(f"Loading clean vocals track: {vocals_clean_wav}")
+        verify_audio = AudioSegment.from_wav(str(vocals_clean_wav))
+    else:
+        print(f"Loading clean audio (vocals sidecar not found, falling back to mix): {clean_mp3}")
+        print("  NOTE: F0 and MFCC checks may be inaccurate due to instrument bleed.")
+        print("  Re-run the full pipeline to generate the vocals sidecar.")
+        verify_audio = AudioSegment.from_mp3(str(clean_mp3))
 
     # Load original vocals (cached by demucs) for word-accurate F0 reference
-    vocals_path = out_dir / "demucs_output" / mp3_path.stem / "vocals.wav"
+    import librosa
+    orig_vocals_path = out_dir / "demucs_output" / mp3_path.stem / "vocals.wav"
     vocals_np = None
     vocals_sr = None
-    if vocals_path.exists():
-        import librosa
+    if orig_vocals_path.exists():
         print(f"  Loading original vocals for F0 reference...")
-        vocals_np, vocals_sr = librosa.load(str(vocals_path), sr=None, mono=True)
+        vocals_np, vocals_sr = librosa.load(str(orig_vocals_path), sr=None, mono=True)
     else:
         print("  (Original vocals not found — F0 check will use context window as fallback)")
 
@@ -933,7 +944,7 @@ def verify_only(mp3_path, words_path):
         start_ms   = int(r["start"] * 1000)
         end_ms     = int(r["end"]   * 1000)
         mute_start = max(0, start_ms - pad)
-        mute_end   = min(len(clean_audio), end_ms + pad)
+        mute_end   = min(len(verify_audio), end_ms + pad)
 
         # Extract the original word audio for accurate F0 reference
         orig_word_np = None
@@ -942,8 +953,8 @@ def verify_only(mp3_path, words_path):
 
         print(f"  [{r['start']:.2f}s - {r['end']:.2f}s]  "
               f"\"{r['original']}\" -> \"{r['replacement']}\"")
-        metrics = _verify_replacement(clean_audio, mute_start, mute_end,
-                                      clean_audio.frame_rate, orig_word_np=orig_word_np)
+        metrics = _verify_replacement(verify_audio, mute_start, mute_end,
+                                      verify_audio.frame_rate, orig_word_np=orig_word_np)
         _print_verification(metrics, r["replacement"])
         if metrics["verdict"] != "PASS":
             all_pass = False
@@ -1047,18 +1058,25 @@ def main():
     voice_sample_path = extract_voice_sample(vocals_path, words, replacements)
 
     # Step 5: Build cleaned audio with voice-cloned replacements
-    cleaned_audio = build_clean_audio(replacements, vocals_path, no_vocals_path, voice_sample_path)
+    cleaned_audio, cleaned_vocals = build_clean_audio(
+        replacements, vocals_path, no_vocals_path, voice_sample_path
+    )
 
     # Save outputs
-    original_txt = output_dir / f"{stem}_original.txt"
-    cleaned_txt_file = output_dir / f"{stem}_cleaned.txt"
-    cleaned_mp3 = output_dir / f"{stem}_clean.mp3"
+    original_txt       = output_dir / f"{stem}_original.txt"
+    cleaned_txt_file   = output_dir / f"{stem}_cleaned.txt"
+    cleaned_mp3        = output_dir / f"{stem}_clean.mp3"
+    cleaned_vocals_wav = output_dir / f"{stem}_vocals_clean.wav"
 
     original_txt.write_text(lyrics, encoding="utf-8")
     cleaned_txt_file.write_text(cleaned_text, encoding="utf-8")
 
     print(f"\nExporting cleaned MP3...")
     cleaned_audio.export(str(cleaned_mp3), format="mp3", bitrate="192k")
+
+    # Save isolated vocals sidecar so --verify can do accurate F0 checks
+    # (full mix contains instruments which corrupt pitch detection)
+    cleaned_vocals.export(str(cleaned_vocals_wav), format="wav")
 
     print()
     print("=" * 60)
