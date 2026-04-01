@@ -132,6 +132,30 @@ Standard linear or exponential fades cause an audible level dip at the crossover
 | `top_db` 30 → 50 | `clone_voice_word()`, both `librosa.effects.trim()` calls | Natural reverb tail preserved; replacement no longer sounds dry |
 | Duck zone -24 dB instead of silence | `build_clean_audio()` mute zone construction | Room tone and reverb continuity maintained; acoustic "hole" eliminated |
 | Equal-power S-curve crossfades, 30 ms | `_apply_crossfade()`, `_apply_eq_power_fade()` throughout `build_clean_audio()` | No level-sweep artefact at edit boundaries; constant perceived loudness |
+| Self-verification (9 metrics) | `_verify_replacement()` + `_print_verification()` called after each overlay in `build_clean_audio()` | Automatically detects whether the replacement blended; prints PASS / WARN / FAIL with per-metric detail |
+
+---
+
+## Self-Verification
+
+After each word is replaced, the pipeline runs `_verify_replacement()` which takes 2 seconds of audio before and after the replaced section and compares 9 metrics against the replacement:
+
+| # | Metric | Ideal | Threshold | What it catches |
+|---|---|---|---|---|
+| 1 | RMS energy ratio | ≈ 1.0 | 0.25 – 4.0 | Replacement too quiet or too loud vs surrounding audio |
+| 2 | Spectral centroid drift | < 60% | 60% | Tonal brightness mismatch — replacement sounds thin or muffled |
+| 3 | Spectral rolloff drift | < 50% | 50% | High-frequency brightness mismatch — sounds dull or tinny |
+| 4 | Splice-in continuity | ≈ 1.0 | 0.1 – 10.0 | Abrupt level jump at the entry cut point |
+| 5 | Splice-out continuity | ≈ 1.0 | 0.1 – 10.0 | Abrupt level jump at the exit cut point |
+| 6 | ZCR ratio at splice | < 5.0× | 5.0× | Click or pop at the splice edge (waveform discontinuity) |
+| 7 | MFCC cosine distance | < 0.15 | 0.15 | Voice/timbre identity — sounds like a different singer |
+| 8 | F0 pitch difference | < 3.0 st | 3 semitones | Replacement is singing the wrong note / outside the song's key |
+| 9 | Chroma cosine distance | < 0.20 | 0.20 | Replacement sits in a different harmonic/musical key space |
+
+**Verdict levels:**
+- `PASS` — 0 warnings: replacement is well-integrated
+- `WARN` — 1–2 warnings: minor issues, may be acceptable on playback
+- `FAIL` — 3+ warnings: replacement likely audible, consider re-running
 
 ---
 

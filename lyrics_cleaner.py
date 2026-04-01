@@ -530,101 +530,206 @@ def _snap_to_onset(vocals_np, sr, timestamp_s, window_s=0.25):
 
 
 def _verify_replacement(vocals_after, mute_start_ms, mute_end_ms, sr, context_s=2.0):
-    """Compare the replaced section against the 2s of audio before and after it.
-    Reports RMS energy ratio, spectral centroid drift, and splice-point continuity.
-    Returns a dict of metrics and a PASS/WARN verdict for each."""
-    import librosa
+    """Compare the replaced section against 2s of surrounding audio on 9 axes.
 
-    # Extract numpy audio from the modified AudioSegment
+    Checks:
+      1.  RMS energy ratio          — loudness match
+      2.  Spectral centroid drift   — tonal brightness match
+      3.  Splice-in  RMS continuity — level jump at entry cut
+      4.  Splice-out RMS continuity — level jump at exit cut
+      5.  ZCR discontinuity        — click/pop at splice edges
+      6.  MFCC cosine distance      — voice/timbre identity match
+      7.  F0 pitch match            — is replacement in the song's key?
+      8.  Spectral rolloff match    — high-frequency brightness match
+      9.  Chroma cosine similarity  — harmonic/musical key match
+    """
+    import librosa
+    from scipy.spatial.distance import cosine as cosine_dist
+
+    # ------------------------------------------------------------------ setup
     raw = np.array(vocals_after.get_array_of_samples(), dtype=np.float32)
     if vocals_after.channels == 2:
         raw = raw.reshape(-1, 2).mean(axis=1)
     raw /= (2 ** (vocals_after.sample_width * 8 - 1))
 
+    frame_rate   = vocals_after.frame_rate
     total_samples = len(raw)
-    frame_rate = vocals_after.frame_rate
-
     ctx_samples  = int(context_s * frame_rate)
-    start_sample = int(mute_start_ms * frame_rate / 1000)
-    end_sample   = int(mute_end_ms   * frame_rate / 1000)
+    start_s      = int(mute_start_ms * frame_rate / 1000)
+    end_s        = int(mute_end_ms   * frame_rate / 1000)
 
-    before_start = max(0, start_sample - ctx_samples)
-    after_end    = min(total_samples, end_sample + ctx_samples)
-
-    seg_before   = raw[before_start:start_sample]
-    seg_replaced = raw[start_sample:end_sample]
-    seg_after    = raw[end_sample:after_end]
+    seg_before   = raw[max(0, start_s - ctx_samples):start_s]
+    seg_replaced = raw[start_s:end_s]
+    seg_after    = raw[end_s:min(total_samples, end_s + ctx_samples)]
+    seg_ctx      = np.concatenate([seg_before, seg_after])  # combined context
 
     results = {}
 
-    # --- 1. RMS energy ratio ---
     def rms(x):
         return float(np.sqrt(np.mean(x ** 2))) if len(x) > 0 else 0.0
 
-    rms_ctx = (rms(seg_before) + rms(seg_after)) / 2 + 1e-9
-    rms_rep = rms(seg_replaced)
-    rms_ratio = rms_rep / rms_ctx
-    results["rms_ratio"] = round(rms_ratio, 3)
-    results["rms_ok"] = 0.25 <= rms_ratio <= 4.0
+    def safe_feature(fn, x, fallback=None):
+        return fn(x) if len(x) >= 512 else fallback
 
-    # --- 2. Spectral centroid drift ---
+    # ------------------------------------------------------------------ 1. RMS ratio
+    rms_ctx = (rms(seg_before) + rms(seg_after)) / 2 + 1e-9
+    rms_ratio = rms(seg_replaced) / rms_ctx
+    results["rms_ratio"] = round(rms_ratio, 3)
+    results["rms_ok"]    = 0.25 <= rms_ratio <= 4.0
+
+    # ------------------------------------------------------------------ 2. Spectral centroid drift
     def mean_centroid(x):
-        if len(x) < 512:
-            return None
         return float(np.mean(librosa.feature.spectral_centroid(y=x, sr=frame_rate)))
 
-    c_before = mean_centroid(seg_before)
-    c_after  = mean_centroid(seg_after)
-    c_rep    = mean_centroid(seg_replaced)
-
-    if c_before and c_after and c_rep:
-        c_ctx = (c_before + c_after) / 2
-        centroid_drift = abs(c_rep - c_ctx) / (c_ctx + 1e-9)
-        results["centroid_drift_pct"] = round(centroid_drift * 100, 1)
-        results["centroid_ok"] = centroid_drift < 0.60  # >60% drift = warning
+    c_ctx = safe_feature(mean_centroid, seg_ctx)
+    c_rep = safe_feature(mean_centroid, seg_replaced)
+    if c_ctx and c_rep:
+        drift = abs(c_rep - c_ctx) / (c_ctx + 1e-9)
+        results["centroid_drift_pct"] = round(drift * 100, 1)
+        results["centroid_ok"]        = drift < 0.60
     else:
         results["centroid_drift_pct"] = None
-        results["centroid_ok"] = True  # too short to measure
+        results["centroid_ok"]        = True
 
-    # --- 3. Splice-point RMS continuity (50ms window either side of each cut) ---
-    snap_ms = 50
-    snap_samples = int(snap_ms * frame_rate / 1000)
+    # ------------------------------------------------------------------ 3 & 4. Splice-point RMS continuity
+    snap = int(0.05 * frame_rate)  # 50 ms window
 
-    pre_splice  = raw[max(0, start_sample - snap_samples):start_sample]
-    post_splice = raw[start_sample:start_sample + snap_samples]
-    splice_in_ratio = (rms(post_splice) / (rms(pre_splice) + 1e-9))
+    pre_in   = raw[max(0, start_s - snap):start_s]
+    post_in  = raw[start_s:start_s + snap]
+    pre_out  = raw[max(0, end_s - snap):end_s]
+    post_out = raw[end_s:end_s + snap]
 
-    pre_out  = raw[max(0, end_sample - snap_samples):end_sample]
-    post_out = raw[end_sample:end_sample + snap_samples]
-    splice_out_ratio = (rms(post_out) / (rms(pre_out) + 1e-9))
+    splice_in  = rms(post_in)  / (rms(pre_in)  + 1e-9)
+    splice_out = rms(post_out) / (rms(pre_out) + 1e-9)
+    results["splice_in_ratio"]  = round(splice_in,  3)
+    results["splice_out_ratio"] = round(splice_out, 3)
+    results["splice_ok"] = (0.1 <= splice_in <= 10.0 and 0.1 <= splice_out <= 10.0)
 
-    results["splice_in_ratio"]  = round(splice_in_ratio,  3)
-    results["splice_out_ratio"] = round(splice_out_ratio, 3)
-    results["splice_ok"] = (0.1 <= splice_in_ratio  <= 10.0 and
-                            0.1 <= splice_out_ratio <= 10.0)
+    # ------------------------------------------------------------------ 5. Zero-crossing rate at splice edges
+    def zcr_density(x):
+        if len(x) < 2:
+            return 0.0
+        return float(np.mean(librosa.feature.zero_crossing_rate(x)))
 
-    # --- Verdict ---
-    passed = results["rms_ok"] and results["centroid_ok"] and results["splice_ok"]
-    results["verdict"] = "PASS" if passed else "WARN"
+    zcr_ctx_in  = (zcr_density(pre_in)  + zcr_density(post_in))  / 2 + 1e-9
+    zcr_ctx_out = (zcr_density(pre_out) + zcr_density(post_out)) / 2 + 1e-9
+    zcr_rep     = zcr_density(seg_replaced)
+    zcr_ratio   = zcr_rep / ((zcr_ctx_in + zcr_ctx_out) / 2 + 1e-9)
+    results["zcr_ratio"] = round(zcr_ratio, 3)
+    results["zcr_ok"]    = zcr_ratio < 5.0  # >5× spike = likely click
+
+    # ------------------------------------------------------------------ 6. MFCC cosine distance (voice identity)
+    def mean_mfcc(x):
+        return np.mean(librosa.feature.mfcc(y=x, sr=frame_rate, n_mfcc=13), axis=1)
+
+    mfcc_ctx = safe_feature(mean_mfcc, seg_ctx)
+    mfcc_rep = safe_feature(mean_mfcc, seg_replaced)
+    if mfcc_ctx is not None and mfcc_rep is not None:
+        mfcc_dist = float(cosine_dist(mfcc_ctx, mfcc_rep))
+        results["mfcc_distance"] = round(mfcc_dist, 4)
+        results["mfcc_ok"]       = mfcc_dist < 0.15  # >0.15 = noticeably different voice
+    else:
+        results["mfcc_distance"] = None
+        results["mfcc_ok"]       = True
+
+    # ------------------------------------------------------------------ 7. F0 pitch match
+    def mean_f0(x):
+        if len(x) < 2048:
+            return None
+        f0, voiced, _ = librosa.pyin(
+            x, fmin=librosa.note_to_hz("C2"), fmax=librosa.note_to_hz("C7"), sr=frame_rate
+        )
+        vf = f0[voiced & ~np.isnan(f0)] if f0 is not None else np.array([])
+        return float(np.mean(vf)) if len(vf) > 0 else None
+
+    f0_ctx = mean_f0(seg_ctx)
+    f0_rep = mean_f0(seg_replaced)
+    if f0_ctx and f0_rep:
+        semitones = abs(12.0 * np.log2(f0_rep / f0_ctx))
+        results["f0_semitone_diff"] = round(float(semitones), 2)
+        results["f0_ok"]            = semitones < 3.0  # >3 semitones = wrong note
+    else:
+        results["f0_semitone_diff"] = None
+        results["f0_ok"]            = True
+
+    # ------------------------------------------------------------------ 8. Spectral rolloff match
+    def mean_rolloff(x):
+        return float(np.mean(librosa.feature.spectral_rolloff(y=x, sr=frame_rate)))
+
+    ro_ctx = safe_feature(mean_rolloff, seg_ctx)
+    ro_rep = safe_feature(mean_rolloff, seg_replaced)
+    if ro_ctx and ro_rep:
+        rolloff_drift = abs(ro_rep - ro_ctx) / (ro_ctx + 1e-9)
+        results["rolloff_drift_pct"] = round(rolloff_drift * 100, 1)
+        results["rolloff_ok"]        = rolloff_drift < 0.50  # >50% = brightness mismatch
+    else:
+        results["rolloff_drift_pct"] = None
+        results["rolloff_ok"]        = True
+
+    # ------------------------------------------------------------------ 9. Chroma cosine similarity (musical key)
+    def mean_chroma(x):
+        return np.mean(librosa.feature.chroma_stft(y=x, sr=frame_rate), axis=1)
+
+    ch_ctx = safe_feature(mean_chroma, seg_ctx)
+    ch_rep = safe_feature(mean_chroma, seg_replaced)
+    if ch_ctx is not None and ch_rep is not None:
+        chroma_dist = float(cosine_dist(ch_ctx + 1e-9, ch_rep + 1e-9))
+        results["chroma_distance"] = round(chroma_dist, 4)
+        results["chroma_ok"]       = chroma_dist < 0.20  # >0.20 = wrong musical key
+    else:
+        results["chroma_distance"] = None
+        results["chroma_ok"]       = True
+
+    # ------------------------------------------------------------------ Verdict
+    ok_flags = [
+        results["rms_ok"], results["centroid_ok"], results["splice_ok"],
+        results["zcr_ok"], results["mfcc_ok"], results["f0_ok"],
+        results["rolloff_ok"], results["chroma_ok"],
+    ]
+    warn_count = ok_flags.count(False)
+    results["warn_count"] = warn_count
+    results["verdict"]    = "PASS" if warn_count == 0 else ("WARN" if warn_count <= 2 else "FAIL")
     return results
 
 
 def _print_verification(metrics, word):
     verdict = metrics["verdict"]
-    tag = "✓" if verdict == "PASS" else "!"
-    print(f"    [{tag}] Verification for \"{word}\":")
-    rms_flag  = "" if metrics["rms_ok"]      else "  ← WARNING: replacement energy mismatch"
-    cent_flag = "" if metrics["centroid_ok"] else "  ← WARNING: timbral drift too high"
-    spl_flag  = "" if metrics["splice_ok"]   else "  ← WARNING: abrupt level jump at splice point"
-    print(f"        RMS ratio (replaced / context):  {metrics['rms_ratio']:.3f}  (ideal ≈ 1.0){rms_flag}")
+    icons = {"PASS": "✓", "WARN": "!", "FAIL": "✗"}
+    tag = icons.get(verdict, "?")
+
+    def flag(ok, msg):
+        return "" if ok else f"  ← {msg}"
+
+    print(f"    [{tag}] Verification for \"{word}\"  ({verdict}, {metrics['warn_count']} warning(s)):")
+    print(f"        RMS energy ratio:          {metrics['rms_ratio']:.3f}   (ideal ≈ 1.0)"
+          + flag(metrics["rms_ok"], "loudness mismatch"))
     if metrics["centroid_drift_pct"] is not None:
-        print(f"        Spectral centroid drift:         {metrics['centroid_drift_pct']:.1f}%  (ideal < 60%){cent_flag}")
-    print(f"        Splice-in  level continuity:     {metrics['splice_in_ratio']:.3f}  (ideal ≈ 1.0){spl_flag}")
-    print(f"        Splice-out level continuity:     {metrics['splice_out_ratio']:.3f}  (ideal ≈ 1.0){spl_flag}")
-    if verdict == "WARN":
-        print(f"        → Replacement may need review.")
-    else:
-        print(f"        → Replacement sounds integrated.")
+        print(f"        Spectral centroid drift:   {metrics['centroid_drift_pct']:.1f}%   (ideal < 60%)"
+              + flag(metrics["centroid_ok"], "timbral brightness mismatch"))
+    if metrics["rolloff_drift_pct"] is not None:
+        print(f"        Spectral rolloff drift:    {metrics['rolloff_drift_pct']:.1f}%   (ideal < 50%)"
+              + flag(metrics["rolloff_ok"], "high-freq brightness mismatch"))
+    print(f"        Splice-in  continuity:     {metrics['splice_in_ratio']:.3f}   (ideal ≈ 1.0)"
+          + flag(metrics["splice_ok"], "abrupt level jump at entry"))
+    print(f"        Splice-out continuity:     {metrics['splice_out_ratio']:.3f}   (ideal ≈ 1.0)"
+          + flag(metrics["splice_ok"], "abrupt level jump at exit"))
+    print(f"        ZCR ratio at splice:       {metrics['zcr_ratio']:.3f}   (ideal < 5.0)"
+          + flag(metrics["zcr_ok"], "click/pop detected at splice edge"))
+    if metrics["mfcc_distance"] is not None:
+        print(f"        MFCC voice distance:       {metrics['mfcc_distance']:.4f}  (ideal < 0.15)"
+              + flag(metrics["mfcc_ok"], "voice/timbre sounds like different singer"))
+    if metrics["f0_semitone_diff"] is not None:
+        print(f"        F0 pitch difference:       {metrics['f0_semitone_diff']:.2f} st  (ideal < 3.0 st)"
+              + flag(metrics["f0_ok"], "replacement is in the wrong musical key"))
+    if metrics["chroma_distance"] is not None:
+        print(f"        Chroma key similarity:     {metrics['chroma_distance']:.4f}  (ideal < 0.20)"
+              + flag(metrics["chroma_ok"], "replacement sits in wrong harmonic space"))
+    conclusion = {
+        "PASS": "→ Replacement sounds integrated.",
+        "WARN": "→ Minor issues detected — may be acceptable.",
+        "FAIL": "→ Replacement likely audible — consider re-running.",
+    }
+    print(f"        {conclusion[verdict]}")
 
 
 def find_target_words(words, target_pairs):
