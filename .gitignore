@@ -6,3 +6,5 @@ demucs_output/
 *.mp3
 *.wav
 .claude/
+*_original.txt
+*_cleaned.txt

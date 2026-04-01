@@ -1,5 +1,2 @@
 Target,Replace
 come,jump
-damn,man
-booty,beauty
-sexy,zesty
