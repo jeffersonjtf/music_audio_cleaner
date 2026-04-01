@@ -120,6 +120,21 @@ Standard linear or exponential fades cause an audible level dip at the crossover
 
 ---
 
+## Summary
+
+| Change | Where in code | Impact |
+|---|---|---|
+| F0 pitch correction | `_correct_f0()` called in `clone_voice_word()` after SEED-VC | Replacement word sings at the correct note instead of the wrong key |
+| Spectral / EQ matching | `_spectral_match()` called in `clone_voice_word()` after F0 fix | Timbre and tonal color match the original recording's mic/room character |
+| Onset snapping | `_snap_to_onset()` called in `build_clean_audio()` per word | Mute window aligns to the true word attack, eliminating Whisper's ±200ms drift |
+| Remove pre-VC stretch | `clone_voice_word()` restructured — no stretch before SEED-VC | Eliminates double phase-vocoder pass and its compounding artifacts |
+| `diffusion_steps` 10 → 30 | `clone_voice_word()`, `wrapper.convert_voice()` call | Much more stable and detailed voice conversion output |
+| `top_db` 30 → 50 | `clone_voice_word()`, both `librosa.effects.trim()` calls | Natural reverb tail preserved; replacement no longer sounds dry |
+| Duck zone -24 dB instead of silence | `build_clean_audio()` mute zone construction | Room tone and reverb continuity maintained; acoustic "hole" eliminated |
+| Equal-power S-curve crossfades, 30 ms | `_apply_crossfade()`, `_apply_eq_power_fade()` throughout `build_clean_audio()` | No level-sweep artefact at edit boundaries; constant perceived loudness |
+
+---
+
 ## Before / After Comparison
 
 | Aspect | Before | After |
