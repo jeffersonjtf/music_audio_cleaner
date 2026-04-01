@@ -8,3 +8,4 @@ demucs_output/
 .claude/
 *_original.txt
 *_cleaned.txt
+*_timestamps.json

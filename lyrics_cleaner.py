@@ -858,6 +858,75 @@ def build_clean_audio(replacements, vocals_path, no_vocals_path, voice_sample_pa
     return cleaned
 
 
+def save_timestamps(words, path):
+    """Cache word timestamps to JSON so --verify skips re-transcription."""
+    import json
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(words, f)
+
+
+def load_timestamps(path):
+    import json
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def verify_only(mp3_path, words_path):
+    """Run the 9-metric verification against an already-cleaned MP3.
+    Requires the *_timestamps.json sidecar written during the full pipeline run.
+    No models are loaded — just audio math against the existing clean file."""
+    stem      = mp3_path.stem
+    out_dir   = mp3_path.parent
+    clean_mp3 = out_dir / f"{stem}_clean.mp3"
+    ts_file   = out_dir / f"{stem}_timestamps.json"
+
+    if not clean_mp3.exists():
+        print(f"Error: clean file not found: {clean_mp3}")
+        print("Run the full pipeline first to produce the clean MP3.")
+        sys.exit(1)
+    if not ts_file.exists():
+        print(f"Error: timestamps file not found: {ts_file}")
+        print("Run the full pipeline once (without --verify) to cache timestamps.")
+        sys.exit(1)
+
+    pairs = load_target_words(words_path)
+    words = load_timestamps(ts_file)
+    replacements = find_target_words(words, pairs)
+
+    if not replacements:
+        print("No target words found in cached timestamps.")
+        return
+
+    print(f"Loading clean audio: {clean_mp3}")
+    clean_audio = AudioSegment.from_mp3(str(clean_mp3))
+
+    pad = 80  # ms — same as full pipeline
+    print(f"\nVerifying {len(replacements)} replacement(s) against clean file...\n")
+
+    all_pass = True
+    for r in replacements:
+        start_ms   = int(r["start"] * 1000)
+        end_ms     = int(r["end"]   * 1000)
+        mute_start = max(0, start_ms - pad)
+        mute_end   = min(len(clean_audio), end_ms + pad)
+
+        print(f"  [{r['start']:.2f}s - {r['end']:.2f}s]  "
+              f"\"{r['original']}\" -> \"{r['replacement']}\"")
+        metrics = _verify_replacement(clean_audio, mute_start, mute_end,
+                                      clean_audio.frame_rate)
+        _print_verification(metrics, r["replacement"])
+        if metrics["verdict"] != "PASS":
+            all_pass = False
+
+    print()
+    print("=" * 60)
+    if all_pass:
+        print("ALL REPLACEMENTS PASSED verification.")
+    else:
+        print("SOME REPLACEMENTS need review (see WARNs/FAILs above).")
+    print("=" * 60)
+
+
 def replace_words_text(text, pairs):
     """Replace target words in text, preserving case."""
     cleaned = text
@@ -876,25 +945,36 @@ def replace_words_text(text, pairs):
 
 
 def main():
-    if len(sys.argv) < 2:
-        print("Usage: python lyrics_cleaner.py <song.mp3> [targetwords.txt] [model_size]")
+    args = sys.argv[1:]
+    verify_mode = "--verify" in args
+    args = [a for a in args if a != "--verify"]
+
+    if not args:
+        print("Usage: python lyrics_cleaner.py <song.mp3> [targetwords.txt] [model_size] [--verify]")
         print()
-        print("  song.mp3         Path to the MP3 file")
+        print("  song.mp3         Path to the original MP3 file")
         print("  targetwords.txt  Path to target words CSV (default: targetwords.txt)")
         print("  model_size       Whisper model: tiny, base, small, medium, large (default: base)")
+        print("  --verify         Re-run only the 9-metric verification against an existing")
+        print("                   *_clean.mp3 (uses cached *_timestamps.json — no models loaded)")
         sys.exit(1)
 
-    mp3_path = Path(sys.argv[1])
+    mp3_path = Path(args[0])
     if not mp3_path.exists():
         print(f"Error: File not found: {mp3_path}")
         sys.exit(1)
 
-    words_path = Path(sys.argv[2]) if len(sys.argv) > 2 else Path("targetwords.txt")
+    words_path = Path(args[1]) if len(args) > 1 else Path("targetwords.txt")
     if not words_path.exists():
         print(f"Error: Target words file not found: {words_path}")
         sys.exit(1)
 
-    model_size = sys.argv[3] if len(sys.argv) > 3 else "base"
+    model_size = args[2] if len(args) > 2 else "base"
+
+    # --verify: skip all model loading, just verify the existing clean file
+    if verify_mode:
+        verify_only(mp3_path, words_path)
+        return
 
     # Load target words
     pairs = load_target_words(words_path)
@@ -902,6 +982,12 @@ def main():
 
     # Step 1: Transcribe with word timestamps
     lyrics, words = transcribe_with_timestamps(mp3_path, model_size)
+
+    # Cache timestamps so --verify can run later without re-transcribing
+    stem = mp3_path.stem
+    output_dir = mp3_path.parent
+    timestamps_file = output_dir / f"{stem}_timestamps.json"
+    save_timestamps(words, timestamps_file)
 
     print()
     print("=" * 60)
@@ -934,9 +1020,6 @@ def main():
     cleaned_audio = build_clean_audio(replacements, vocals_path, no_vocals_path, voice_sample_path)
 
     # Save outputs
-    stem = mp3_path.stem
-    output_dir = mp3_path.parent
-
     original_txt = output_dir / f"{stem}_original.txt"
     cleaned_txt_file = output_dir / f"{stem}_cleaned.txt"
     cleaned_mp3 = output_dir / f"{stem}_clean.mp3"
