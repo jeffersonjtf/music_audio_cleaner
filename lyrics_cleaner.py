@@ -304,16 +304,17 @@ def extract_voice_sample(vocals_path, words, replacements, target_duration=30.0)
 
 def clone_voice_word(text, voice_sample_path, vocals_path, start_s, end_s, duration_ms):
     """Generate a replacement word that sounds like the original singer.
-    Two-stage pipeline:
-    1. XTTS-v2 generates the replacement word as speech (correct phonemes)
-    2. SEED-VC v2 converts that speech to match the singer's voice (preserves melody)
-    3. Time-stretched to exact duration"""
+    Pipeline:
+    1. XTTS-v2 generates speech (phonemes/timing) — no pre-VC stretch
+    2. SEED-VC converts it to the singer's voice (30 diffusion steps for quality)
+    3. F0 correction aligns pitch center to original sung word
+    4. Spectral matching aligns timbre/EQ to original recording
+    5. Single time-stretch to exact target duration"""
     import librosa
 
     tts_model = get_tts_model()
 
-    # Step 1: Generate TTS of the replacement word (voice timbre doesn't matter much
-    # since SEED-VC will convert it, but using singer's sample helps with prosody)
+    # Step 1: Generate TTS
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
         tts_raw_path = tmp.name
 
@@ -324,48 +325,33 @@ def clone_voice_word(text, voice_sample_path, vocals_path, start_s, end_s, durat
         file_path=tts_raw_path,
     )
 
-    # Step 2: Time-stretch TTS output to match original word duration
+    # Step 2: Trim TTS — relaxed threshold preserves natural reverb tail
     y, sr = librosa.load(tts_raw_path, sr=None)
     Path(tts_raw_path).unlink(missing_ok=True)
 
-    y, _ = librosa.effects.trim(y, top_db=30)
+    y, _ = librosa.effects.trim(y, top_db=50)  # was 30 — looser = keeps reverb tail
 
     if len(y) == 0:
         return AudioSegment.silent(duration=duration_ms)
 
-    target_samples = int(duration_ms * sr / 1000)
-    if target_samples > 0 and len(y) > 0:
-        stretch_factor = len(y) / target_samples
-        stretch_factor = max(0.5, min(3.0, stretch_factor))
-        if abs(stretch_factor - 1.0) > 0.05:
-            y = librosa.effects.time_stretch(y, rate=stretch_factor)
-
-    if len(y) < target_samples:
-        y = np.pad(y, (0, target_samples - len(y)))
-    else:
-        y = y[:target_samples]
-
-    # Save time-stretched TTS for SEED-VC input
+    # Save raw TTS directly for SEED-VC (no pre-VC stretch — avoids double-stretch artifacts)
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-        tts_stretched_path = tmp.name
-    sf.write(tts_stretched_path, y, sr)
+        tts_for_vc_path = tmp.name
+    sf.write(tts_for_vc_path, y, sr)
 
     # Step 3: Voice conversion with SEED-VC
-    # Converts the TTS speech to sound like the original singer
-    # f0_condition=True preserves melody/pitch from source
     print(f"    Converting to singer's voice with SEED-VC...")
     wrapper = get_seedvc_wrapper()
 
-    # convert_voice is a generator — collect the last yielded full audio
     vc_sr = None
     vc_audio = None
     for mp3_bytes, full_audio in wrapper.convert_voice(
-        source=tts_stretched_path,
+        source=tts_for_vc_path,
         target=str(voice_sample_path),
-        diffusion_steps=10,
+        diffusion_steps=30,         # was 10 — higher = much better voice quality
         length_adjust=1.0,
         inference_cfg_rate=0.7,
-        f0_condition=True,  # preserve melody from source
+        f0_condition=True,
         auto_f0_adjust=True,
         pitch_shift=0,
         stream_output=True,
@@ -373,18 +359,27 @@ def clone_voice_word(text, voice_sample_path, vocals_path, start_s, end_s, durat
         if full_audio is not None:
             vc_sr, vc_audio = full_audio
 
-    Path(tts_stretched_path).unlink(missing_ok=True)
+    Path(tts_for_vc_path).unlink(missing_ok=True)
 
     if vc_audio is None:
         return AudioSegment.silent(duration=duration_ms)
 
-    # Trim silence from VC output
     vc_audio = vc_audio.astype(np.float32)
-    vc_trimmed, _ = librosa.effects.trim(vc_audio, top_db=30)
+
+    # Trim VC output — same relaxed threshold
+    vc_trimmed, _ = librosa.effects.trim(vc_audio, top_db=50)
     if len(vc_trimmed) == 0:
         vc_trimmed = vc_audio
 
-    # Final time-stretch to exact target duration
+    # Step 4: F0 correction — shift pitch center to match original sung word
+    y_orig, _ = librosa.load(str(vocals_path), sr=vc_sr, offset=start_s,
+                              duration=max(end_s - start_s, 0.1))
+    vc_trimmed = _correct_f0(vc_trimmed, vc_sr, y_orig, vc_sr)
+
+    # Step 5: Spectral matching — match EQ/timbre to original recording context
+    vc_trimmed = _spectral_match(vc_trimmed, y_orig, vc_sr)
+
+    # Step 6: Single time-stretch to exact target duration (only one pass total)
     target_samples_vc = int(duration_ms * vc_sr / 1000)
     if target_samples_vc > 0 and len(vc_trimmed) > 0:
         stretch_factor = len(vc_trimmed) / target_samples_vc
@@ -407,11 +402,131 @@ def clone_voice_word(text, voice_sample_path, vocals_path, start_s, end_s, durat
     return result
 
 
+def _eq_power_curve(n, fade_in=True):
+    """Equal-power (sin/cos) S-curve for crossfading. Returns float64 array [0,1] or [1,0]."""
+    t = np.linspace(0, np.pi / 2, n)
+    return np.sin(t) if fade_in else np.cos(t)
+
+
+def _apply_eq_power_fade(segment, fade_ms, fade_in=True):
+    """Apply an equal-power fade-in or fade-out to an AudioSegment using numpy."""
+    if len(segment) == 0:
+        return segment
+    fade_ms = min(fade_ms, len(segment) // 2)
+    if fade_ms <= 0:
+        return segment
+
+    n_fade = int(fade_ms * segment.frame_rate / 1000)
+    channels = segment.channels
+    sample_width = segment.sample_width
+
+    arr = np.array(segment.get_array_of_samples(), dtype=np.float64)
+    curve = _eq_power_curve(n_fade, fade_in=fade_in)
+
+    for c in range(channels):
+        if fade_in:
+            arr[c::channels][:n_fade] *= curve
+        else:
+            arr[c::channels][-n_fade:] *= curve
+
+    max_val = (2 ** (sample_width * 8 - 1)) - 1
+    arr = np.clip(arr, -max_val, max_val)
+    int_type = np.int16 if sample_width == 2 else np.int32
+    return segment._spawn(arr.astype(int_type).tobytes())
+
+
 def _apply_crossfade(audio, fade_ms=30):
-    """Apply smooth fade in/out to avoid clicks."""
-    if len(audio) < fade_ms * 2:
-        fade_ms = max(5, len(audio) // 4)
-    return audio.fade_in(fade_ms).fade_out(fade_ms)
+    """Apply equal-power S-curve fade in + fade out."""
+    if len(audio) == 0:
+        return audio
+    fade_ms = min(fade_ms, len(audio) // 2)
+    audio = _apply_eq_power_fade(audio, fade_ms, fade_in=True)
+    audio = _apply_eq_power_fade(audio, fade_ms, fade_in=False)
+    return audio
+
+
+def _correct_f0(y_vc, sr_vc, y_orig, sr_orig):
+    """Pitch-shift VC output so its mean F0 matches the original sung word.
+    Corrects the key mismatch between flat TTS prosody and the song's melody."""
+    import librosa
+
+    def mean_f0(y, sr):
+        f0, voiced, _ = librosa.pyin(
+            y, fmin=librosa.note_to_hz("C2"), fmax=librosa.note_to_hz("C7"), sr=sr
+        )
+        voiced_f0 = f0[voiced & ~np.isnan(f0)] if f0 is not None else np.array([])
+        return float(np.mean(voiced_f0)) if len(voiced_f0) > 0 else 0.0
+
+    mean_orig = mean_f0(y_orig, sr_orig)
+    mean_vc   = mean_f0(y_vc,   sr_vc)
+
+    if mean_orig <= 0 or mean_vc <= 0:
+        return y_vc
+
+    semitones = 12.0 * np.log2(mean_orig / mean_vc)
+    semitones = float(np.clip(semitones, -12, 12))
+
+    if abs(semitones) < 0.5:
+        return y_vc
+
+    print(f"    F0 correction: {mean_vc:.1f} Hz → {mean_orig:.1f} Hz ({semitones:+.1f} st)")
+    return librosa.effects.pitch_shift(y_vc, sr=sr_vc, n_steps=semitones)
+
+
+def _spectral_match(y_replacement, y_original, sr):
+    """Match the per-frequency magnitude envelope of the replacement to the original.
+    Ensures the replacement word has the same tonal character as the recording."""
+    import librosa
+    from scipy.ndimage import uniform_filter1d
+
+    if len(y_original) < 512 or len(y_replacement) < 512:
+        return y_replacement
+
+    n_fft = 2048
+    D_orig = librosa.stft(y_original,    n_fft=n_fft)
+    D_repl = librosa.stft(y_replacement, n_fft=n_fft)
+
+    mag_orig = np.mean(np.abs(D_orig), axis=1) + 1e-8
+    mag_repl = np.mean(np.abs(D_repl), axis=1) + 1e-8
+
+    gains = mag_orig / mag_repl
+    gains = uniform_filter1d(gains, size=20)        # smooth over frequency bins
+    gains = np.clip(gains, 0.1, 10.0)               # ±20 dB max correction
+
+    D_matched = D_repl * gains[:, np.newaxis]
+    y_matched = librosa.istft(D_matched, length=len(y_replacement))
+    return y_matched.astype(np.float32)
+
+
+def _snap_to_onset(vocals_np, sr, timestamp_s, window_s=0.25):
+    """Snap a Whisper word timestamp to the nearest energy onset in the vocals.
+    Corrects Whisper's ±50-200 ms drift so mute/overlay windows align precisely."""
+    import librosa
+
+    center = int(timestamp_s * sr)
+    half   = int(window_s * sr)
+    seg_start = max(0, center - half)
+    seg_end   = min(len(vocals_np), center + half)
+
+    if seg_end <= seg_start:
+        return timestamp_s
+
+    segment = vocals_np[seg_start:seg_end]
+
+    onsets = librosa.onset.onset_detect(
+        y=segment, sr=sr, units="samples", hop_length=128, backtrack=True
+    )
+
+    if len(onsets) == 0:
+        return timestamp_s
+
+    center_in_seg = center - seg_start
+    closest = onsets[int(np.argmin(np.abs(onsets - center_in_seg)))]
+
+    # Clamp snap to ±200 ms of the original Whisper timestamp
+    snapped_s = (seg_start + int(closest)) / sr
+    snapped_s = float(np.clip(snapped_s, timestamp_s - 0.2, timestamp_s + 0.2))
+    return snapped_s
 
 
 def find_target_words(words, target_pairs):
@@ -454,6 +569,8 @@ def find_target_words(words, target_pairs):
 
 def build_clean_audio(replacements, vocals_path, no_vocals_path, voice_sample_path):
     """Build cleaned MP3 using TTS + SEED-VC voice conversion + seamless blending."""
+    import librosa
+
     print(f"\nLoading separated tracks...")
     vocals = AudioSegment.from_wav(str(vocals_path))
     original_vocals = AudioSegment.from_wav(str(vocals_path))  # pristine copy
@@ -464,51 +581,63 @@ def build_clean_audio(replacements, vocals_path, no_vocals_path, voice_sample_pa
         min_len = min(len(vocals), len(accompaniment))
         return accompaniment[:min_len].overlay(vocals[:min_len])
 
+    # Load vocals as mono numpy array once for onset snapping
+    print("  Loading vocals for onset detection...")
+    vocals_np, vocals_sr = librosa.load(str(vocals_path), sr=None, mono=True)
+
     print(f"Replacing {len(replacements)} word(s) with voice-cloned audio...\n")
 
-    fade_ms = 100  # longer crossfade for smoother transitions
+    fade_ms = 30  # shorter = snappier, less level-sweep artefact at boundaries
 
     for r in replacements:
-        start_ms = int(r["start"] * 1000)
-        end_ms = int(r["end"] * 1000)
+        # Snap Whisper timestamps to true energy onsets (corrects ±50-200ms drift)
+        snapped_start = _snap_to_onset(vocals_np, vocals_sr, r["start"])
+        snapped_end   = _snap_to_onset(vocals_np, vocals_sr, r["end"])
 
-        # Pad for crossfade zones
-        pad = 120  # ms
+        start_ms = int(snapped_start * 1000)
+        end_ms   = int(snapped_end   * 1000)
+
+        # Tighter pad now that timestamps are accurately snapped
+        pad = 80  # ms
         mute_start = max(0, start_ms - pad)
-        mute_end = min(len(vocals), end_ms + pad)
+        mute_end   = min(len(vocals), end_ms + pad)
         mute_duration = mute_end - mute_start
 
-        print(f"  [{r['start']:.2f}s - {r['end']:.2f}s] "
+        print(f"  [{r['start']:.2f}s → {snapped_start:.2f}s] "
               f"\"{r['original']}\" -> \"{r['replacement']}\"")
 
-        # Clone the singer's voice + apply their melody + match dynamics
         tts = clone_voice_word(
             r["replacement"], voice_sample_path, vocals_path,
-            r["start"], r["end"], mute_duration
+            snapped_start, snapped_end, mute_duration
         )
 
-        # --- Volume matching ---
+        # Volume matching against the snapped segment
         ref_segment = original_vocals[start_ms:end_ms]
         original_loudness = ref_segment.dBFS
         if tts.dBFS > -50 and original_loudness > -50:
             tts = tts.apply_gain(original_loudness - tts.dBFS + 2)
 
-        # --- Smooth crossfade on replacement ---
+        # Equal-power crossfade on the replacement clip
         tts = _apply_crossfade(tts, fade_ms=fade_ms)
 
         # --- Crossfaded suppression of original word ---
+        # Duck to -24 dB instead of silence: preserves room tone and reverb tail
         before = vocals[:mute_start]
 
         fade_out_end = min(mute_start + fade_ms, mute_end)
-        fade_out_zone = vocals[mute_start:fade_out_end].fade_out(fade_ms)
+        fade_out_zone = _apply_eq_power_fade(
+            vocals[mute_start:fade_out_end], fade_ms, fade_in=False
+        )
 
         duck_start = fade_out_end
-        duck_end = max(mute_end - fade_ms, duck_start)
-        ducked_zone = AudioSegment.silent(duration=duck_end - duck_start,
-                                          frame_rate=vocals.frame_rate)
+        duck_end   = max(mute_end - fade_ms, duck_start)
+        # -24 dB keeps reverb/room tone; the replacement overlaid on top dominates
+        ducked_zone = original_vocals[duck_start:duck_end].apply_gain(-24)
 
         fade_in_start = duck_end
-        fade_in_zone = vocals[fade_in_start:mute_end].fade_in(fade_ms)
+        fade_in_zone = _apply_eq_power_fade(
+            vocals[fade_in_start:mute_end], fade_ms, fade_in=True
+        )
 
         after = vocals[mute_end:]
 
