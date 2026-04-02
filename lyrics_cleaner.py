@@ -371,10 +371,10 @@ def clone_voice_word(text, voice_sample_path, vocals_path, start_s, end_s, durat
     if len(vc_trimmed) == 0:
         vc_trimmed = vc_audio
 
-    # Step 4: F0 correction — shift pitch center to match original sung word
+    # Step 4: F0 contour transfer — warp pitch to follow original word's melodic arc
     y_orig, _ = librosa.load(str(vocals_path), sr=vc_sr, offset=start_s,
                               duration=max(end_s - start_s, 0.1))
-    vc_trimmed = _correct_f0(vc_trimmed, vc_sr, y_orig, vc_sr)
+    vc_trimmed = _transfer_f0_contour(vc_trimmed, vc_sr, y_orig, vc_sr)
 
     # Step 5: Spectral matching — match EQ/timbre to original recording context
     vc_trimmed = _spectral_match(vc_trimmed, y_orig, vc_sr)
@@ -445,17 +445,18 @@ def _apply_crossfade(audio, fade_ms=30):
     return audio
 
 
-def _correct_f0(y_vc, sr_vc, y_orig, sr_orig):
-    """Pitch-shift VC output so its mean F0 matches the original sung word.
-    Corrects the key mismatch between flat TTS prosody and the song's melody."""
+def _mean_f0_correct_fallback(y_vc, sr_vc, y_orig, sr_orig):
+    """Single mean-pitch shift. Used when the clip is too short for contour transfer."""
     import librosa
 
     def mean_f0(y, sr):
+        if len(y) < 2048:
+            return 0.0
         f0, voiced, _ = librosa.pyin(
             y, fmin=librosa.note_to_hz("C2"), fmax=librosa.note_to_hz("C7"), sr=sr
         )
-        voiced_f0 = f0[voiced & ~np.isnan(f0)] if f0 is not None else np.array([])
-        return float(np.mean(voiced_f0)) if len(voiced_f0) > 0 else 0.0
+        vf = f0[voiced & ~np.isnan(f0)] if f0 is not None else np.array([])
+        return float(np.mean(vf)) if len(vf) > 0 else 0.0
 
     mean_orig = mean_f0(y_orig, sr_orig)
     mean_vc   = mean_f0(y_vc,   sr_vc)
@@ -463,14 +464,106 @@ def _correct_f0(y_vc, sr_vc, y_orig, sr_orig):
     if mean_orig <= 0 or mean_vc <= 0:
         return y_vc
 
-    semitones = 12.0 * np.log2(mean_orig / mean_vc)
-    semitones = float(np.clip(semitones, -12, 12))
-
+    semitones = float(np.clip(12.0 * np.log2(mean_orig / mean_vc), -12, 12))
     if abs(semitones) < 0.5:
         return y_vc
 
-    print(f"    F0 correction: {mean_vc:.1f} Hz → {mean_orig:.1f} Hz ({semitones:+.1f} st)")
-    return librosa.effects.pitch_shift(y_vc, sr=sr_vc, n_steps=semitones)
+    print(f"    F0 correction (fallback mean): {mean_vc:.1f} Hz → {mean_orig:.1f} Hz ({semitones:+.1f} st)")
+    return librosa.effects.pitch_shift(y_vc, sr=sr_vc, n_steps=semitones).astype(np.float32)
+
+
+def _transfer_f0_contour(y_vc, sr_vc, y_orig, sr_orig):
+    """Spline-based F0 contour transfer: replaces single mean-pitch shift with
+    per-segment shifts derived from a time-normalized F0 curve extracted from
+    the original sung word. The replacement follows the melodic arc of the
+    original rather than just landing on the average note.
+
+    Splits audio into N segments (min 4096 samples each, max 6).
+    For each segment uses the median of the smoothed semitone-offset curve
+    over that time slice, then applies librosa.pitch_shift independently.
+
+    Falls back to mean-pitch correction when either signal has fewer than
+    4 reliably voiced pyin frames (too short for contour estimation).
+    """
+    import librosa
+    from scipy.ndimage import gaussian_filter1d
+
+    HOP      = 256    # pyin hop length (frames)
+    MIN_SEG  = 4096   # min samples per segment (~93 ms @ 44100 Hz)
+    MAX_SEGS = 6      # cap to limit phase-vocoder passes
+    SIGMA    = 4      # Gaussian smoothing width (frames) on semitone curve
+
+    def extract_f0_full(y, sr):
+        if len(y) < 2048:
+            return None, None
+        f0, voiced, _ = librosa.pyin(
+            y, fmin=librosa.note_to_hz("C2"), fmax=librosa.note_to_hz("C7"),
+            sr=sr, hop_length=HOP,
+        )
+        return f0, voiced
+
+    f0_orig, v_orig = extract_f0_full(y_orig, sr_orig)
+    f0_vc,   v_vc   = extract_f0_full(y_vc,   sr_vc)
+
+    if f0_orig is None or f0_vc is None:
+        return _mean_f0_correct_fallback(y_vc, sr_vc, y_orig, sr_orig)
+
+    valid_orig = v_orig & ~np.isnan(f0_orig) & (f0_orig > 0)
+    valid_vc   = v_vc   & ~np.isnan(f0_vc)   & (f0_vc   > 0)
+
+    if valid_orig.sum() < 4 or valid_vc.sum() < 4:
+        return _mean_f0_correct_fallback(y_vc, sr_vc, y_orig, sr_orig)
+
+    # Time-normalize: interpolate f0_orig onto vc's frame axis so different
+    # word durations map onto the same 0–1 time axis before comparison.
+    t_orig = np.linspace(0, 1, len(f0_orig))
+    t_vc   = np.linspace(0, 1, len(f0_vc))
+    f0_orig_resampled = np.interp(t_vc, t_orig[valid_orig], f0_orig[valid_orig])
+
+    # Per-frame semitone offset where vc is voiced
+    semitone_curve = np.zeros(len(f0_vc))
+    semitone_curve[valid_vc] = 12.0 * np.log2(
+        f0_orig_resampled[valid_vc] / (f0_vc[valid_vc] + 1e-9)
+    )
+    # Fill unvoiced frames with voiced mean so smoothing doesn't pull toward 0
+    mean_shift = float(np.mean(semitone_curve[valid_vc]))
+    semitone_curve[~valid_vc] = mean_shift
+    semitone_curve = gaussian_filter1d(semitone_curve, sigma=SIGMA)
+    semitone_curve = np.clip(semitone_curve, -12, 12)
+
+    n_seg = max(1, min(MAX_SEGS, len(y_vc) // MIN_SEG))
+
+    if n_seg == 1:
+        # Too short for multi-segment — apply single median shift from the curve
+        shift = float(np.median(semitone_curve[valid_vc]))
+        if abs(shift) < 0.5:
+            return y_vc
+        print(f"    F0 contour (1 seg): {shift:+.1f} st")
+        return librosa.effects.pitch_shift(y_vc, sr=sr_vc, n_steps=shift).astype(np.float32)
+
+    # Apply per-segment shifts derived from the smoothed contour curve
+    boundaries = np.linspace(0, len(y_vc), n_seg + 1, dtype=int)
+    result_segs = []
+    shifts_applied = []
+
+    for i in range(n_seg):
+        seg = y_vc[boundaries[i]:boundaries[i + 1]]
+
+        f_start = int(i       / n_seg * len(semitone_curve))
+        f_end   = int((i + 1) / n_seg * len(semitone_curve))
+        shift = float(np.median(semitone_curve[f_start:f_end]))
+        shift = float(np.clip(shift, -12, 12))
+        shifts_applied.append(shift)
+
+        if abs(shift) >= 0.3:
+            seg = librosa.effects.pitch_shift(seg, sr=sr_vc, n_steps=shift)
+
+        result_segs.append(seg.astype(np.float32))
+
+    print(f"    F0 contour ({n_seg} segs): " +
+          " / ".join(f"{s:+.1f}" for s in shifts_applied) + " st")
+
+    return np.concatenate(result_segs).astype(np.float32)
 
 
 def _spectral_match(y_replacement, y_original, sr):
@@ -530,24 +623,28 @@ def _snap_to_onset(vocals_np, sr, timestamp_s, window_s=0.25):
 
 
 def _verify_replacement(vocals_after, mute_start_ms, mute_end_ms, sr,
-                        context_s=2.0, orig_word_np=None):
-    """Compare the replaced section against 2s of surrounding audio on 9 axes.
+                        context_s=2.0, orig_word_np=None, fade_ms=30):
+    """Compare the replaced section against 2s of surrounding audio on 10 axes.
 
     orig_word_np: the original sung word as a numpy array (same sample rate as
-    vocals_after). When provided, F0 is verified against this specific note
-    rather than the 2s context window, which contains other melody notes and
-    would give a false F0 warning.
+    vocals_after). When provided, F0 and contour metrics compare against this
+    specific note rather than the 2s context window.
+
+    fade_ms: the crossfade window used during blending (default 30). Used to
+    offset the splice-continuity measurement windows past the transition zone
+    so they reflect steady-state replacement level rather than the ramp itself.
 
     Checks:
-      1.  RMS energy ratio          — loudness match
-      2.  Spectral centroid drift   — tonal brightness match
-      3.  Splice-in  RMS continuity — level jump at entry cut
-      4.  Splice-out RMS continuity — level jump at exit cut
-      5.  ZCR discontinuity        — click/pop at splice edges
-      6.  MFCC cosine distance      — voice/timbre identity match
-      7.  F0 pitch match            — is replacement on the same note as original word?
-      8.  Spectral rolloff match    — high-frequency brightness match
-      9.  Chroma cosine similarity  — harmonic/musical key match
+      1.  RMS energy ratio           — loudness match
+      2.  Spectral centroid drift    — tonal brightness match
+      3.  Splice-in  RMS continuity  — level at steady-state entry vs pre-edit
+      4.  Splice-out RMS continuity  — level at pre-exit vs post-edit
+      5.  ZCR discontinuity          — click/pop at splice edges
+      6.  MFCC cosine distance       — voice/timbre identity match
+      7.  F0 mean pitch match        — replacement on the same note as original?
+      8.  Spectral rolloff match     — high-frequency brightness match
+      9.  Chroma cosine similarity   — harmonic/musical key match
+      10. F0 contour correlation     — melodic arc shape match (contour transfer quality)
     """
     import librosa
     from scipy.spatial.distance import cosine as cosine_dist
@@ -598,18 +695,26 @@ def _verify_replacement(vocals_after, mute_start_ms, mute_end_ms, sr,
         results["centroid_ok"]        = True
 
     # ------------------------------------------------------------------ 3 & 4. Splice-point RMS continuity
-    snap = int(0.05 * frame_rate)  # 50 ms window
+    # Windows are offset by fade_ms past the splice boundary so they measure
+    # steady-state levels (after the crossfade completes) rather than the ramp
+    # itself — this gives values that are meaningfully close to 1.0 when the
+    # blend is working correctly.
+    snap      = int(0.05  * frame_rate)  # 50 ms measurement window
+    fade_samp = int(fade_ms * frame_rate / 1000)
 
-    pre_in   = raw[max(0, start_s - snap):start_s]
-    post_in  = raw[start_s:start_s + snap]
-    pre_out  = raw[max(0, end_s - snap):end_s]
+    # Splice-in:  50ms before splice (original) vs 50ms starting after the fade-in
+    pre_in  = raw[max(0, start_s - snap):start_s]
+    post_in = raw[start_s + fade_samp : start_s + fade_samp + snap]
+
+    # Splice-out: 50ms ending before the fade-out starts vs 50ms after splice
+    pre_out  = raw[max(0, end_s - fade_samp - snap) : end_s - fade_samp]
     post_out = raw[end_s:end_s + snap]
 
     splice_in  = rms(post_in)  / (rms(pre_in)  + 1e-9)
     splice_out = rms(post_out) / (rms(pre_out) + 1e-9)
     results["splice_in_ratio"]  = round(splice_in,  3)
     results["splice_out_ratio"] = round(splice_out, 3)
-    results["splice_ok"] = (0.1 <= splice_in <= 10.0 and 0.1 <= splice_out <= 10.0)
+    results["splice_ok"] = (0.5 <= splice_in <= 2.0 and 0.5 <= splice_out <= 2.0)
 
     # ------------------------------------------------------------------ 5. Zero-crossing rate at splice edges
     def zcr_density(x):
@@ -690,11 +795,50 @@ def _verify_replacement(vocals_after, mute_start_ms, mute_end_ms, sr,
         results["chroma_distance"] = None
         results["chroma_ok"]       = True
 
+    # ------------------------------------------------------------------ 10. F0 contour correlation (contour transfer quality)
+    # Compares the melodic shape of the replacement against the original word.
+    # Uses Pearson r on time-normalized voiced F0 frames.
+    # Only meaningful when orig_word_np is provided and both clips are long enough.
+    def voiced_f0_curve(x, sr):
+        if len(x) < 2048:
+            return None
+        f0, voiced, _ = librosa.pyin(
+            x, fmin=librosa.note_to_hz("C2"), fmax=librosa.note_to_hz("C7"),
+            sr=sr, hop_length=256,
+        )
+        valid = voiced & ~np.isnan(f0) & (f0 > 0) if f0 is not None else np.zeros(0, bool)
+        return (f0, valid) if valid.sum() >= 4 else None
+
+    contour_orig = voiced_f0_curve(orig_word_np, frame_rate) if orig_word_np is not None else None
+    contour_rep  = voiced_f0_curve(seg_replaced, frame_rate)
+
+    if contour_orig is not None and contour_rep is not None:
+        f0_o, v_o = contour_orig
+        f0_r, v_r = contour_rep
+        # Time-normalize both to 32 points for a stable correlation estimate
+        N = 32
+        t_o = np.linspace(0, 1, len(f0_o))
+        t_r = np.linspace(0, 1, len(f0_r))
+        t_n = np.linspace(0, 1, N)
+        curve_o = np.interp(t_n, t_o[v_o], f0_o[v_o])
+        curve_r = np.interp(t_n, t_r[v_r], f0_r[v_r])
+        # Pearson correlation on log-Hz so semitone differences are linear
+        log_o = np.log2(curve_o + 1e-9)
+        log_r = np.log2(curve_r + 1e-9)
+        corr = float(np.corrcoef(log_o, log_r)[0, 1])
+        if np.isnan(corr):
+            corr = 0.0
+        results["f0_contour_corr"] = round(corr, 3)
+        results["f0_contour_ok"]   = corr > 0.50  # <0.5 = contour shape doesn't match
+    else:
+        results["f0_contour_corr"] = None
+        results["f0_contour_ok"]   = True  # not enough data → don't penalise
+
     # ------------------------------------------------------------------ Verdict
     ok_flags = [
         results["rms_ok"], results["centroid_ok"], results["splice_ok"],
         results["zcr_ok"], results["mfcc_ok"], results["f0_ok"],
-        results["rolloff_ok"], results["chroma_ok"],
+        results["rolloff_ok"], results["chroma_ok"], results["f0_contour_ok"],
     ]
     warn_count = ok_flags.count(False)
     results["warn_count"] = warn_count
@@ -734,6 +878,9 @@ def _print_verification(metrics, word):
     if metrics["chroma_distance"] is not None:
         print(f"        Chroma key similarity:     {metrics['chroma_distance']:.4f}  (ideal < 0.20)"
               + flag(metrics["chroma_ok"], "replacement sits in wrong harmonic space"))
+    if metrics.get("f0_contour_corr") is not None:
+        print(f"        F0 contour correlation:    {metrics['f0_contour_corr']:.3f}   (ideal > 0.50)"
+              + flag(metrics["f0_contour_ok"], "melodic arc shape doesn't match original"))
     conclusion = {
         "PASS": "→ Replacement sounds integrated.",
         "WARN": "→ Minor issues detected — may be acceptable.",
@@ -862,7 +1009,7 @@ def build_clean_audio(replacements, vocals_path, no_vocals_path, voice_sample_pa
         # not the context window average (which spans many different melody notes).
         orig_word_np = vocals_np[int(snapped_start * vocals_sr):int(snapped_end * vocals_sr)]
         metrics = _verify_replacement(vocals, mute_start, mute_end, vocals_sr,
-                                      orig_word_np=orig_word_np)
+                                      orig_word_np=orig_word_np, fade_ms=fade_ms)
         _print_verification(metrics, r["replacement"])
 
     # Remix vocals + accompaniment
@@ -954,7 +1101,8 @@ def verify_only(mp3_path, words_path):
         print(f"  [{r['start']:.2f}s - {r['end']:.2f}s]  "
               f"\"{r['original']}\" -> \"{r['replacement']}\"")
         metrics = _verify_replacement(verify_audio, mute_start, mute_end,
-                                      verify_audio.frame_rate, orig_word_np=orig_word_np)
+                                      verify_audio.frame_rate, orig_word_np=orig_word_np,
+                                      fade_ms=30)
         _print_verification(metrics, r["replacement"])
         if metrics["verdict"] != "PASS":
             all_pass = False
