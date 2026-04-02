@@ -17,6 +17,7 @@ def ensure_dependencies():
         ("whisper", "openai-whisper"),
         ("demucs", "demucs"),
         ("scipy", "scipy"),
+        ("pronouncing", "pronouncing"),
     ]
 
     missing = []
@@ -119,16 +120,243 @@ def get_seedvc_wrapper():
     return _seedvc_wrapper
 
 
+# ---------------------------------------------------------------------------
+# Phonetic child-friendly replacement selection
+# ---------------------------------------------------------------------------
+
+# Blocklist of words not appropriate for children. Conservative — covers
+# profanity, sexual terms, and violent language commonly found in adult music.
+_ADULT_WORDS = {
+    "ass", "arse", "asshole", "bastard", "bitch", "bitches", "booty", "bugger",
+    "bullshit", "cock", "cocks", "crap", "cum", "cunt", "cunts", "damn", "damned",
+    "dick", "dicks", "dildo", "dumbass", "dyke", "fag", "faggot", "fags", "fart",
+    "fuck", "fucked", "fucker", "fuckers", "fucking", "fucks", "goddamn", "goddamned",
+    "hell", "homo", "horny", "jackass", "jerk", "jizz", "kill", "kills", "killing",
+    "kys", "motherfucker", "motherfuckers", "motherfucking", "negro", "nigga",
+    "nigger", "niggers", "penis", "piss", "pissed", "prick", "pricks", "pussy",
+    "pussies", "rape", "raped", "rapist", "retard", "retarded", "sex", "sexy",
+    "shit", "shits", "shitty", "slut", "sluts", "spunk", "suck", "sucking",
+    "tit", "tits", "twat", "twats", "vagina", "wank", "wanker", "whore", "whores",
+    # softer terms still flagged
+    "come", "boobs", "boner", "butt", "crap", "dammit", "freaking", "friggin",
+    "frigging", "hoe", "hoes", "ho", "humping", "jerk-off", "kinky", "lust",
+    "lusty", "naked", "nude", "orgasm", "pervert", "pimp", "pimping", "smut",
+    "stripper", "thot", "twerk", "twerking", "whoring",
+}
+
+
+def _is_child_friendly(word: str) -> bool:
+    """Return True if word is not in the adult-content blocklist."""
+    return word.strip().lower() not in _ADULT_WORDS
+
+
+def _get_stressed_vowel(phones_str: str) -> str | None:
+    """Extract the ARPAbet symbol of the primary-stressed vowel from a phones string."""
+    vowels = {"AA", "AE", "AH", "AO", "AW", "AY", "EH", "ER", "EY",
+              "IH", "IY", "OW", "OY", "UH", "UW"}
+    for ph in phones_str.split():
+        if ph.endswith("1") and ph[:-1] in vowels:
+            return ph[:-1]
+    return None
+
+
+def _phonetic_score(target: str, replacement: str) -> dict:
+    """Score phonetic compatibility of replacement vs target on three axes.
+
+    Returns a dict:
+      score          0–3 (higher = more compatible)
+      syllables_match, stress_match, vowel_match  — bool each
+      target_syllables, repl_syllables            — int
+      target_stress, repl_stress                  — str  (e.g. "1", "10", "010")
+      target_vowel,  repl_vowel                   — str|None  (ARPAbet, e.g. "AH")
+      cmu_found                                   — bool (False if either word not in CMU dict)
+    """
+    import pronouncing
+
+    t_phones = pronouncing.phones_for_word(target.lower())
+    r_phones = pronouncing.phones_for_word(replacement.lower())
+
+    if not t_phones or not r_phones:
+        return {"score": 0, "syllables_match": False, "stress_match": False,
+                "vowel_match": False, "cmu_found": False,
+                "target_syllables": None, "repl_syllables": None,
+                "target_stress": None, "repl_stress": None,
+                "target_vowel": None, "repl_vowel": None}
+
+    tp = t_phones[0]
+    rp = r_phones[0]
+
+    t_syll  = pronouncing.syllable_count(tp)
+    r_syll  = pronouncing.syllable_count(rp)
+    t_stress = pronouncing.stresses(tp)
+    r_stress = pronouncing.stresses(rp)
+    t_vowel  = _get_stressed_vowel(tp)
+    r_vowel  = _get_stressed_vowel(rp)
+
+    syll_ok   = t_syll == r_syll
+    stress_ok = t_stress == r_stress
+    vowel_ok  = (t_vowel is not None and t_vowel == r_vowel)
+    score     = int(syll_ok) + int(stress_ok) + int(vowel_ok)
+
+    return {"score": score, "syllables_match": syll_ok, "stress_match": stress_ok,
+            "vowel_match": vowel_ok, "cmu_found": True,
+            "target_syllables": t_syll, "repl_syllables": r_syll,
+            "target_stress": t_stress, "repl_stress": r_stress,
+            "target_vowel": t_vowel, "repl_vowel": r_vowel}
+
+
+def _find_best_replacement(target: str) -> tuple[str, dict]:
+    """Auto-select the best child-friendly, phonetically-matched replacement
+    from the CMU Pronouncing Dictionary.
+
+    Priority:
+      1. Same syllable count + same stressed vowel + child-friendly
+      2. Same syllable count + child-friendly  (vowel relaxed)
+      3. First child-friendly 1-syllable word found  (last resort)
+    """
+    import pronouncing
+
+    t_phones = pronouncing.phones_for_word(target.lower())
+    if not t_phones:
+        return ("beep", {"score": 0, "cmu_found": False})
+
+    tp       = t_phones[0]
+    t_stress = pronouncing.stresses(tp)
+    t_syll   = pronouncing.syllable_count(tp)
+    t_vowel  = _get_stressed_vowel(tp)
+
+    # All CMU words with same stress pattern
+    candidates = pronouncing.search_stresses(f"^{re.escape(t_stress)}$")
+
+    # Score and filter
+    scored = []
+    for w in candidates:
+        if w.lower() == target.lower():
+            continue
+        if not _is_child_friendly(w):
+            continue
+        sc = _phonetic_score(target, w)
+        if sc["syllables_match"]:
+            scored.append((sc["score"], w, sc))
+
+    if scored:
+        # Sort by score desc, then alphabetically for stability
+        scored.sort(key=lambda x: (-x[0], x[1]))
+        _, best_word, best_sc = scored[0]
+        return (best_word, best_sc)
+
+    # Fallback: same syllable count, child-friendly, any vowel
+    all_words = [w for w in pronouncing.search_stresses(r"\d")
+                 if w.lower() != target.lower() and _is_child_friendly(w)]
+    same_syll = []
+    for w in all_words:
+        wp = pronouncing.phones_for_word(w.lower())
+        if wp and pronouncing.syllable_count(wp[0]) == t_syll:
+            same_syll.append(w)
+    if same_syll:
+        best = same_syll[0]
+        return (best, _phonetic_score(target, best))
+
+    return ("beep", {"score": 0, "cmu_found": False})
+
+
+def _validate_and_resolve_replacement(target: str, suggested: str | None) -> tuple[str, dict]:
+    """Validate a user-suggested replacement and fall back to auto-selection if needed.
+
+    Returns (final_word, report) where report contains:
+      source          — "user_suggestion" | "auto_selected"
+      rejected_reason — str | None  (why user suggestion was rejected)
+      phonetic        — result from _phonetic_score
+    """
+    if suggested:
+        child_ok = _is_child_friendly(suggested)
+        ps = _phonetic_score(target, suggested)
+
+        if not child_ok:
+            auto_word, auto_ps = _find_best_replacement(target)
+            return (auto_word, {"source": "auto_selected",
+                                "rejected_reason": f"'{suggested}' is not child-friendly",
+                                "phonetic": auto_ps, "rejected_word": suggested})
+
+        if ps["score"] < 2:
+            reason = []
+            if not ps["syllables_match"]:
+                reason.append(f"syllable mismatch ({ps['target_syllables']} vs {ps['repl_syllables']})")
+            if not ps["vowel_match"]:
+                reason.append(f"vowel mismatch ({ps['target_vowel']} vs {ps['repl_vowel']})")
+            auto_word, auto_ps = _find_best_replacement(target)
+            return (auto_word, {"source": "auto_selected",
+                                "rejected_reason": f"'{suggested}' score {ps['score']}/3: " + "; ".join(reason),
+                                "phonetic": auto_ps, "rejected_word": suggested})
+
+        # Suggestion passes both checks
+        return (suggested, {"source": "user_suggestion", "rejected_reason": None, "phonetic": ps})
+
+    # No suggestion — auto-select
+    auto_word, auto_ps = _find_best_replacement(target)
+    return (auto_word, {"source": "auto_selected", "rejected_reason": None, "phonetic": auto_ps})
+
+
+def _print_phonetic_report(target: str, report: dict) -> None:
+    """Print the phonetic selection report for one target word."""
+    ps     = report["phonetic"]
+    source = report["source"]
+    final  = report.get("final_word", "?")
+
+    if report["rejected_reason"]:
+        print(f"    ✗ Rejected '{report['rejected_word']}': {report['rejected_reason']}")
+
+    src_tag = "user suggestion" if source == "user_suggestion" else "auto-selected"
+    print(f"    Replacement: \"{final}\"  [{src_tag}]")
+
+    if not ps.get("cmu_found", True):
+        print(f"    (word not in CMU dict — phonetic score unavailable)")
+        return
+
+    def tick(ok): return "✓" if ok else "✗"
+    print(f"    Phonetic compatibility ({ps['score']}/3):")
+    print(f"      Syllables:      {ps['target_syllables']} {'==' if ps['syllables_match'] else '!='} {ps['repl_syllables']}  {tick(ps['syllables_match'])}")
+    print(f"      Stress pattern: {ps['target_stress']} {'==' if ps['stress_match'] else '!='} {ps['repl_stress']}  {tick(ps['stress_match'])}")
+    tv = ps['target_vowel'] or '?'
+    rv = ps['repl_vowel']   or '?'
+    print(f"      Stressed vowel: {tv} {'==' if ps['vowel_match'] else '!='} {rv}  {tick(ps['vowel_match'])}")
+    if ps["score"] == 3:
+        print(f"      → Excellent phonetic fit")
+    elif ps["score"] == 2:
+        print(f"      → Acceptable fit")
+    else:
+        print(f"      → Poor fit (audio processing will need to compensate)")
+
+
 def load_target_words(filepath):
-    """Load target/replace word pairs from CSV file."""
+    """Load and resolve target→replace pairs from CSV.
+
+    Replace column is optional. Each replacement is:
+      1. Validated for child-friendliness
+      2. Scored for phonetic compatibility (syllables, stress, vowel)
+      3. Replaced by auto-selection if it fails either check or is missing
+
+    Returns dict: {target_lower: resolved_replacement_word}
+    Phonetic reports are printed during loading.
+    """
     pairs = {}
+    print()
     with open(filepath, newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         for row in reader:
-            target = row["Target"].strip().lower()
-            replace = row["Replace"].strip()
-            if replace:  # skip empty replacements
-                pairs[target] = replace
+            target  = row["Target"].strip().lower()
+            if not target:
+                continue
+            suggest = row.get("Replace", "").strip() or None
+
+            final_word, report = _validate_and_resolve_replacement(target, suggest)
+            report["final_word"] = final_word
+
+            print(f'  Target: "{target}"')
+            _print_phonetic_report(target, report)
+            print()
+
+            pairs[target] = final_word
     return pairs
 
 
@@ -846,7 +1074,7 @@ def _verify_replacement(vocals_after, mute_start_ms, mute_end_ms, sr,
     return results
 
 
-def _print_verification(metrics, word):
+def _print_verification(metrics, word, phonetic_score=None):
     verdict = metrics["verdict"]
     icons = {"PASS": "✓", "WARN": "!", "FAIL": "✗"}
     tag = icons.get(verdict, "?")
@@ -855,6 +1083,17 @@ def _print_verification(metrics, word):
         return "" if ok else f"  ← {msg}"
 
     print(f"    [{tag}] Verification for \"{word}\"  ({verdict}, {metrics['warn_count']} warning(s)):")
+    if phonetic_score is not None:
+        ps = phonetic_score
+        if ps.get("cmu_found", False):
+            tv = ps.get("target_vowel") or "?"
+            rv = ps.get("repl_vowel")   or "?"
+            vowel_note = f"  ({tv}={'==' if ps['vowel_match'] else '!='}{rv})"
+            print(f"        Phonetic fit:              {ps['score']}/3"
+                  + f"  (syll {'✓' if ps['syllables_match'] else '✗'}"
+                  + f"  stress {'✓' if ps['stress_match'] else '✗'}"
+                  + f"  vowel {'✓' if ps['vowel_match'] else '✗'})"
+                  + vowel_note)
     print(f"        RMS energy ratio:          {metrics['rms_ratio']:.3f}   (ideal ≈ 1.0)"
           + flag(metrics["rms_ok"], "loudness mismatch"))
     if metrics["centroid_drift_pct"] is not None:
@@ -890,7 +1129,8 @@ def _print_verification(metrics, word):
 
 
 def find_target_words(words, target_pairs):
-    """Find words in transcript that match target words."""
+    """Find words in transcript that match target words.
+    Each replacement dict includes phonetic_score for use in verification output."""
     replacements = []
     max_phrase_len = max((len(t.split()) for t in target_pairs), default=1)
 
@@ -903,11 +1143,13 @@ def find_target_words(words, target_pairs):
             phrase_clean = re.sub(r"[^\w\s]", "", phrase_text).strip()
 
             if phrase_clean in target_pairs:
+                repl = target_pairs[phrase_clean]
                 replacements.append({
                     "original": phrase_text,
-                    "replacement": target_pairs[phrase_clean],
+                    "replacement": repl,
                     "start": phrase_words[0]["start"],
                     "end": phrase_words[-1]["end"],
+                    "phonetic_score": _phonetic_score(phrase_clean, repl),
                 })
                 i += phrase_len
                 matched = True
@@ -916,11 +1158,13 @@ def find_target_words(words, target_pairs):
         if not matched:
             word_clean = re.sub(r"[^\w]", "", words[i]["word"]).lower()
             if word_clean in target_pairs:
+                repl = target_pairs[word_clean]
                 replacements.append({
                     "original": words[i]["word"],
-                    "replacement": target_pairs[word_clean],
+                    "replacement": repl,
                     "start": words[i]["start"],
                     "end": words[i]["end"],
+                    "phonetic_score": _phonetic_score(word_clean, repl),
                 })
             i += 1
 
@@ -1010,7 +1254,8 @@ def build_clean_audio(replacements, vocals_path, no_vocals_path, voice_sample_pa
         orig_word_np = vocals_np[int(snapped_start * vocals_sr):int(snapped_end * vocals_sr)]
         metrics = _verify_replacement(vocals, mute_start, mute_end, vocals_sr,
                                       orig_word_np=orig_word_np, fade_ms=fade_ms)
-        _print_verification(metrics, r["replacement"])
+        _print_verification(metrics, r["replacement"],
+                            phonetic_score=r.get("phonetic_score"))
 
     # Remix vocals + accompaniment
     print("\nRemixing vocals with accompaniment...")

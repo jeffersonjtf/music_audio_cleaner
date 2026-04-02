@@ -4,3 +4,4 @@ demucs
 soundfile
 TTS
 seed-vc
+pronouncing

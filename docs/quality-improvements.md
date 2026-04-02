@@ -136,6 +136,74 @@ Standard linear or exponential fades cause an audible level dip at the crossover
 
 ---
 
+## Phonetic Child-Friendly Replacement Selection
+
+### Overview
+
+Instead of using the Replace word verbatim, the pipeline now validates and optionally auto-selects the best replacement using the CMU Pronouncing Dictionary (`pronouncing` library, pure Python, Windows-safe).
+
+### targetwords.txt contract
+
+Only `Target` is required. `Replace` is an optional hint:
+
+```csv
+Target,Replace
+damn,
+booty,fun
+come,
+```
+
+- **Empty Replace** → system auto-selects the best child-friendly phonetic match
+- **Provided Replace** → validated for child-friendliness and phonetic compatibility (score ≥ 2/3); used only if both pass, otherwise discarded and auto-selection runs
+
+### Phonetic scoring (3 axes, 0–3)
+
+| Axis | Points | Rule |
+|---|---|---|
+| Syllable count | 1 | replacement syllables == target syllables |
+| Stress pattern | 1 | same ARPAbet stress string (e.g. `"1"` == `"1"`) |
+| Stressed vowel | 1 | same ARPAbet vowel on primary stress (AH, AY, etc.) |
+
+Score 3/3 = excellent; 2/3 = acceptable; 1/3 or 0/3 = reject and auto-replace.
+
+### Child-friendly filter
+
+A curated `_ADULT_WORDS` blocklist (~70 profane/adult/violent words) is checked first. A candidate passes if it is **not** in this set — no network calls, no external API.
+
+### Auto-selection algorithm
+
+1. Get the target's ARPAbet stress pattern and stressed vowel via `pronouncing`
+2. `pronouncing.search_stresses(pattern)` returns all CMU words with the same stress
+3. Filter: same stressed vowel + not in adult blocklist + not the target word itself
+4. Sort by: exact syllable count match first, then alphabetically
+5. If no exact-vowel match: widen to same syllable count + child-friendly (vowel is dropped as fallback)
+6. Last resort: `"beep"`
+
+### Example console output
+
+```
+Loaded 2 target word(s) from targetwords.txt
+
+  "damn"  → user suggestion "fun"
+    Child-friendly: ✓
+    Syllables:      1 = 1  ✓
+    Stress pattern: 1 = 1  ✓
+    Stressed vowel: AE ≠ AH  ✗  (score 2/3)
+    → Score acceptable (2/3), using "fun"
+
+  "come"  → no suggestion provided
+    Auto-selecting child-friendly phonetic match...
+    Stressed vowel target: AH, stress pattern: 1
+    Best match: "run"  (AH vowel, score 3/3)
+    → Using "run"
+```
+
+### Impact
+
+A phonetically matched replacement reduces the burden on every downstream audio processing stage — F0 correction has less to shift, spectral matching has less to equalize, and the time-stretch ratio stays closer to 1.0.
+
+---
+
 ## Self-Verification
 
 After each word is replaced, the pipeline runs `_verify_replacement()` which takes 2 seconds of audio before and after the replaced section and compares 9 metrics against the replacement:
