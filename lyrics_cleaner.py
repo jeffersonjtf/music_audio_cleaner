@@ -3,7 +3,40 @@ import subprocess
 import csv
 import re
 import tempfile
+import os
 from pathlib import Path
+from datetime import datetime
+
+
+class _Tee:
+    """Mirror stdout to terminal (verbatim) and log file (with per-line timestamps)."""
+
+    def __init__(self, terminal, log_fh):
+        self._terminal = terminal
+        self._log_fh   = log_fh
+        self._buf      = ""  # partial-line buffer for timestamp stamping
+
+    def write(self, data):
+        self._terminal.write(data)
+        self._buf += data
+        while "\n" in self._buf:
+            line, self._buf = self._buf.split("\n", 1)
+            ts = datetime.now().strftime("%H:%M:%S.%f")[:12]  # HH:MM:SS.mmm
+            self._log_fh.write(f"[{ts}] {line}\n")
+
+    def flush(self):
+        self._terminal.flush()
+        self._log_fh.flush()
+
+
+def _setup_logging():
+    logs_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+    os.makedirs(logs_dir, exist_ok=True)
+    now  = datetime.now()
+    path = os.path.join(logs_dir, f"terminal_{now.strftime('%Y-%m-%d_%H%M%S')}.log")
+    log_fh = open(path, "w", encoding="utf-8")
+    sys.stdout = _Tee(sys.__stdout__, log_fh)
+    return path, log_fh
 
 
 def ensure_dependencies():
@@ -1379,6 +1412,9 @@ def replace_words_text(text, pairs):
 
 
 def main():
+    log_path, _log_fh = _setup_logging()
+    print(f"Logging to: {log_path}")
+
     args = sys.argv[1:]
     verify_mode = "--verify" in args
     args = [a for a in args if a != "--verify"]

@@ -10,3 +10,4 @@ demucs_output/
 *_cleaned.txt
 *_timestamps.json
 *_vocals_clean.wav
+logs/
