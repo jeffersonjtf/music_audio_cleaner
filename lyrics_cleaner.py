@@ -706,6 +706,139 @@ def _apply_crossfade(audio, fade_ms=30):
     return audio
 
 
+_MAX_CORRECTION_ROUNDS = 5
+
+
+def _seg_to_np(seg):
+    """Convert pydub AudioSegment to float32 mono numpy array. Returns (array, sample_rate)."""
+    raw = np.array(seg.get_array_of_samples(), dtype=np.float32)
+    if seg.channels == 2:
+        raw = raw.reshape(-1, 2).mean(axis=1)
+    raw /= (2 ** (seg.sample_width * 8 - 1))
+    return raw, seg.frame_rate
+
+
+def _np_to_seg(y, sr):
+    """Convert float32 mono numpy array to a mono 16-bit pydub AudioSegment."""
+    y_int = np.clip(y * 32767, -32768, 32767).astype(np.int16)
+    return AudioSegment(y_int.tobytes(), frame_rate=int(sr), sample_width=2, channels=1)
+
+
+def _apply_splice(vocals_base, repl_seg, mute_start, mute_end, original_vocals, fade_ms):
+    """Splice repl_seg into vocals_base at [mute_start:mute_end] ms with equal-power crossfades.
+    original_vocals is the pristine untouched vocal track used only for the -24 dB duck zone."""
+    before = vocals_base[:mute_start]
+
+    fade_out_end = min(mute_start + fade_ms, mute_end)
+    fade_out_zone = _apply_eq_power_fade(
+        vocals_base[mute_start:fade_out_end], fade_ms, fade_in=False
+    )
+
+    duck_start  = fade_out_end
+    duck_end    = max(mute_end - fade_ms, duck_start)
+    ducked_zone = original_vocals[duck_start:duck_end].apply_gain(-24)
+
+    fade_in_start = duck_end
+    fade_in_zone  = _apply_eq_power_fade(
+        vocals_base[fade_in_start:mute_end], fade_ms, fade_in=True
+    )
+
+    after   = vocals_base[mute_end:]
+    spliced = before + fade_out_zone + ducked_zone + fade_in_zone + after
+    spliced = spliced.overlay(repl_seg, position=mute_start)
+    return spliced
+
+
+def _auto_correct(repl_np, sr, metrics, vocals_ctx, mute_start_ms, mute_end_ms, fade_ms):
+    """Apply targeted per-metric corrections to repl_np based on failed _verify_replacement results.
+
+    Corrections applied (in order):
+      1. Directed F0 pitch shift  — uses stored f0_ref/f0_rep for signed correction
+      2. Spectral re-match        — re-runs _spectral_match against verification context window
+      3. Splice-in level ramp     — boosts/attenuates the replacement entry window
+      4. Splice-out level ramp    — boosts/attenuates the replacement exit window
+      5. RMS normalization        — scales overall loudness to match context
+
+    Each correction is a partial step (0.6×) toward the ideal to avoid oscillation.
+    """
+    import librosa
+
+    y = repl_np.copy()
+
+    # Extract surrounding context audio from the vocals track at this splice point
+    ctx_raw, ctx_sr = _seg_to_np(vocals_ctx)
+    ctx_samp   = int(2.0 * ctx_sr)
+    ctx_start  = int(mute_start_ms * ctx_sr / 1000)
+    ctx_end    = int(mute_end_ms   * ctx_sr / 1000)
+    ctx_before = ctx_raw[max(0, ctx_start - ctx_samp):ctx_start]
+    ctx_after  = ctx_raw[ctx_end:min(len(ctx_raw), ctx_end + ctx_samp)]
+    context_np = np.concatenate([ctx_before, ctx_after])
+
+    # Resample context to match repl_np SR if needed (for spectral/RMS comparisons)
+    if ctx_sr != sr and len(context_np) > 0:
+        context_np = librosa.resample(context_np, orig_sr=ctx_sr, target_sr=sr)
+
+    fade_samp = int(fade_ms * sr / 1000)
+    snap_samp = int(0.05 * sr)  # 50ms — matches _verify_replacement measurement window
+
+    # --- 1. Directed F0 pitch correction ---
+    f0_ref = metrics.get("f0_ref")
+    f0_rep = metrics.get("f0_rep")
+    if not metrics["f0_ok"] and f0_ref and f0_rep and f0_ref > 0 and f0_rep > 0:
+        n_steps = float(np.clip(12.0 * np.log2(f0_ref / f0_rep), -6.0, 6.0))
+        if abs(n_steps) > 0.3:
+            y = librosa.effects.pitch_shift(y, sr=sr, n_steps=n_steps).astype(np.float32)
+
+    # --- 2. Spectral re-match against context ---
+    if not metrics.get("centroid_ok", True) or not metrics.get("rolloff_ok", True):
+        if len(context_np) >= 512:
+            y = _spectral_match(y, context_np, sr)
+
+    def _level_ramp(arr, win_start, win_end, gain):
+        """Apply a smoothly tapered gain envelope to arr[win_start:win_end]."""
+        if win_end <= win_start or win_start >= len(arr):
+            return arr
+        win_end = min(win_end, len(arr))
+        n = win_end - win_start
+        taper = max(1, n // 6)
+        env = np.full(n, gain, dtype=np.float32)
+        env[:taper]  = np.linspace(1.0, gain, taper)
+        env[-taper:] = np.linspace(gain, 1.0, taper)
+        arr = arr.copy()
+        arr[win_start:win_end] *= env
+        return arr
+
+    # --- 3. Splice-in boundary correction ---
+    # splice_in = rms(post_in) / rms(pre_in)
+    # post_in is 50ms of replacement after the fade-in window.
+    # Multiply that window by (1/splice_in) to bring ratio toward 1.0.
+    splice_in = metrics["splice_in_ratio"]
+    if not (0.5 <= splice_in <= 2.0):
+        raw_gain = float(np.clip(1.0 / max(splice_in, 1e-3), 0.25, 4.0))
+        gain = 1.0 + (raw_gain - 1.0) * 0.6
+        y = _level_ramp(y, fade_samp, fade_samp + snap_samp, gain)
+
+    # --- 4. Splice-out boundary correction ---
+    # splice_out = rms(post_out) / rms(pre_out)
+    # pre_out is 50ms of replacement just before the fade-out window.
+    # Multiply that window by splice_out to bring ratio toward 1.0.
+    splice_out = metrics["splice_out_ratio"]
+    if not (0.5 <= splice_out <= 2.0):
+        raw_gain = float(np.clip(splice_out, 0.25, 4.0))
+        gain = 1.0 + (raw_gain - 1.0) * 0.6
+        fade_out_start = max(0, len(y) - fade_samp)
+        y = _level_ramp(y, fade_out_start - snap_samp, fade_out_start, gain)
+
+    # --- 5. RMS normalization ---
+    if not metrics["rms_ok"]:
+        rms_ctx = float(np.sqrt(np.mean(context_np ** 2))) if len(context_np) > 0 else 1.0
+        rms_y   = float(np.sqrt(np.mean(y ** 2))) + 1e-9
+        gain    = float(np.clip(rms_ctx / rms_y, 0.5, 2.0))
+        y = y * gain
+
+    return y.astype(np.float32)
+
+
 def _mean_f0_correct_fallback(y_vc, sr_vc, y_orig, sr_orig):
     """Single mean-pitch shift. Used when the clip is too short for contour transfer."""
     import librosa
@@ -884,7 +1017,7 @@ def _snap_to_onset(vocals_np, sr, timestamp_s, window_s=0.25):
 
 
 def _verify_replacement(vocals_after, mute_start_ms, mute_end_ms, sr,
-                        context_s=2.0, orig_word_np=None, fade_ms=30):
+                        context_s=2.0, orig_word_np=None, fade_ms=30, mix_word_np=None):
     """Compare the replaced section against 2s of surrounding audio on 10 axes.
 
     orig_word_np: the original sung word as a numpy array (same sample rate as
@@ -1024,9 +1157,30 @@ def _verify_replacement(vocals_after, mute_start_ms, mute_end_ms, sr,
         semitones = abs(12.0 * np.log2(f0_rep / f0_ref))
         results["f0_semitone_diff"] = round(float(semitones), 2)
         results["f0_ok"]            = semitones < 3.0  # >3 semitones = wrong note
+        results["f0_ref"]           = round(float(f0_ref), 2)  # stored for directed auto-correction
+        results["f0_rep"]           = round(float(f0_rep), 2)
     else:
         results["f0_semitone_diff"] = None
         results["f0_ok"]            = True
+        results["f0_ref"]           = None
+        results["f0_rep"]           = None
+
+    # ------------------------------------------------------------------ 7b. F0 vs full song mix (informational)
+    # Extracts F0 from the original unseparated mix at this word's timestamp.
+    # Instruments add noise but this shows how the replacement sits in the full musical context.
+    # Not counted as a warning — informational display only.
+    if mix_word_np is not None and len(mix_word_np) >= 2048:
+        f0_mix = mean_f0(mix_word_np)
+        f0_cur = results.get("f0_rep") or (mean_f0(seg_replaced) if len(seg_replaced) >= 2048 else None)
+        if f0_mix and f0_cur:
+            results["f0_mix_diff"] = round(abs(12.0 * np.log2(f0_cur / f0_mix)), 2)
+            results["f0_mix_ref"]  = round(float(f0_mix), 2)
+        else:
+            results["f0_mix_diff"] = None
+            results["f0_mix_ref"]  = None
+    else:
+        results["f0_mix_diff"] = None
+        results["f0_mix_ref"]  = None
 
     # ------------------------------------------------------------------ 8. Spectral rolloff match
     def mean_rolloff(x):
@@ -1107,7 +1261,7 @@ def _verify_replacement(vocals_after, mute_start_ms, mute_end_ms, sr,
     return results
 
 
-def _print_verification(metrics, word, phonetic_score=None):
+def _print_verification(metrics, word, phonetic_score=None, round_label=""):
     verdict = metrics["verdict"]
     icons = {"PASS": "✓", "WARN": "!", "FAIL": "✗"}
     tag = icons.get(verdict, "?")
@@ -1115,7 +1269,8 @@ def _print_verification(metrics, word, phonetic_score=None):
     def flag(ok, msg):
         return "" if ok else f"  ← {msg}"
 
-    print(f"    [{tag}] Verification for \"{word}\"  ({verdict}, {metrics['warn_count']} warning(s)):")
+    label_suffix = f"  [{round_label}]" if round_label else ""
+    print(f"    [{tag}] Verification for \"{word}\"  ({verdict}, {metrics['warn_count']} warning(s)){label_suffix}:")
     if phonetic_score is not None:
         ps = phonetic_score
         if ps.get("cmu_found", False):
@@ -1145,8 +1300,10 @@ def _print_verification(metrics, word, phonetic_score=None):
         print(f"        MFCC voice distance:       {metrics['mfcc_distance']:.4f}  (ideal < 0.15)"
               + flag(metrics["mfcc_ok"], "voice/timbre sounds like different singer"))
     if metrics["f0_semitone_diff"] is not None:
-        print(f"        F0 pitch difference:       {metrics['f0_semitone_diff']:.2f} st  (ideal < 3.0 st)"
+        print(f"        F0 vs isolated vocals:     {metrics['f0_semitone_diff']:.2f} st  (ideal < 3.0 st)"
               + flag(metrics["f0_ok"], "replacement is in the wrong musical key"))
+    if metrics.get("f0_mix_diff") is not None:
+        print(f"        F0 vs original mix:        {metrics['f0_mix_diff']:.2f} st  (ref {metrics['f0_mix_ref']:.1f} Hz, informational)")
     if metrics["chroma_distance"] is not None:
         print(f"        Chroma key similarity:     {metrics['chroma_distance']:.4f}  (ideal < 0.20)"
               + flag(metrics["chroma_ok"], "replacement sits in wrong harmonic space"))
@@ -1204,7 +1361,8 @@ def find_target_words(words, target_pairs):
     return replacements
 
 
-def build_clean_audio(replacements, vocals_path, no_vocals_path, voice_sample_path):
+def build_clean_audio(replacements, vocals_path, no_vocals_path, voice_sample_path,
+                      mix_path=None):
     """Build cleaned MP3 using TTS + SEED-VC voice conversion + seamless blending."""
     import librosa
 
@@ -1221,6 +1379,13 @@ def build_clean_audio(replacements, vocals_path, no_vocals_path, voice_sample_pa
     # Load vocals as mono numpy array once for onset snapping
     print("  Loading vocals for onset detection...")
     vocals_np, vocals_sr = librosa.load(str(vocals_path), sr=None, mono=True)
+
+    # Load original mix for secondary F0 reference (full song, pre-separation)
+    mix_np = None
+    mix_sr = None
+    if mix_path is not None:
+        print("  Loading original mix for F0 reference comparison...")
+        mix_np, mix_sr = librosa.load(str(mix_path), sr=None, mono=True)
 
     print(f"Replacing {len(replacements)} word(s) with voice-cloned audio...\n")
 
@@ -1257,38 +1422,53 @@ def build_clean_audio(replacements, vocals_path, no_vocals_path, voice_sample_pa
         # Equal-power crossfade on the replacement clip
         tts = _apply_crossfade(tts, fade_ms=fade_ms)
 
-        # --- Crossfaded suppression of original word ---
-        # Duck to -24 dB instead of silence: preserves room tone and reverb tail
-        before = vocals[:mute_start]
+        # Convert to numpy so corrections can be applied iteratively
+        repl_np, sr_vc = _seg_to_np(tts)
 
-        fade_out_end = min(mute_start + fade_ms, mute_end)
-        fade_out_zone = _apply_eq_power_fade(
-            vocals[mute_start:fade_out_end], fade_ms, fade_in=False
-        )
+        # Snapshot of vocals before this word's splice — used for re-trying after corrections
+        vocals_before_word = vocals
 
-        duck_start = fade_out_end
-        duck_end   = max(mute_end - fade_ms, duck_start)
-        # -24 dB keeps reverb/room tone; the replacement overlaid on top dominates
-        ducked_zone = original_vocals[duck_start:duck_end].apply_gain(-24)
-
-        fade_in_start = duck_end
-        fade_in_zone = _apply_eq_power_fade(
-            vocals[fade_in_start:mute_end], fade_ms, fade_in=True
-        )
-
-        after = vocals[mute_end:]
-
-        vocals = before + fade_out_zone + ducked_zone + fade_in_zone + after
-        vocals = vocals.overlay(tts, position=mute_start)
-
-        # Self-verify: compare replaced section against 2s of surrounding context.
-        # Pass the original word audio so F0 is checked against that specific note,
-        # not the context window average (which spans many different melody notes).
+        # Original word audio for F0 reference (extracted from unmodified isolated vocals)
         orig_word_np = vocals_np[int(snapped_start * vocals_sr):int(snapped_end * vocals_sr)]
-        metrics = _verify_replacement(vocals, mute_start, mute_end, vocals_sr,
-                                      orig_word_np=orig_word_np, fade_ms=fade_ms)
-        _print_verification(metrics, r["replacement"],
-                            phonetic_score=r.get("phonetic_score"))
+
+        # Full-mix reference segment for secondary F0 comparison (informational)
+        mix_word_np = None
+        if mix_np is not None and mix_sr is not None:
+            mix_word_np = mix_np[int(snapped_start * mix_sr):int(snapped_end * mix_sr)]
+
+        for attempt in range(_MAX_CORRECTION_ROUNDS + 1):
+            # Convert corrected numpy back to AudioSegment; resample to vocals rate if needed
+            repl_seg = _np_to_seg(repl_np, sr_vc)
+            if repl_seg.frame_rate != vocals_before_word.frame_rate:
+                repl_seg = repl_seg.set_frame_rate(vocals_before_word.frame_rate)
+
+            # Splice into a candidate vocals track (non-destructive — base is unchanged)
+            vocals_candidate = _apply_splice(
+                vocals_before_word, repl_seg, mute_start, mute_end,
+                original_vocals, fade_ms
+            )
+
+            # Verify: compare replaced section against surrounding context on 10 axes
+            metrics = _verify_replacement(
+                vocals_candidate, mute_start, mute_end, vocals_sr,
+                orig_word_np=orig_word_np, fade_ms=fade_ms,
+                mix_word_np=mix_word_np
+            )
+            round_label = "initial" if attempt == 0 else f"round {attempt}"
+            _print_verification(metrics, r["replacement"],
+                                phonetic_score=r.get("phonetic_score"),
+                                round_label=round_label)
+
+            if metrics["verdict"] == "PASS" or attempt == _MAX_CORRECTION_ROUNDS:
+                vocals = vocals_candidate
+                break
+
+            # Apply targeted corrections to the numpy replacement for next round
+            print(f"    Auto-correcting ({round_label} → round {attempt + 1})...")
+            repl_np = _auto_correct(
+                repl_np, sr_vc, metrics, vocals_before_word,
+                mute_start, mute_end, fade_ms
+            )
 
     # Remix vocals + accompaniment
     print("\nRemixing vocals with accompaniment...")
@@ -1488,7 +1668,8 @@ def main():
 
     # Step 5: Build cleaned audio with voice-cloned replacements
     cleaned_audio, cleaned_vocals = build_clean_audio(
-        replacements, vocals_path, no_vocals_path, voice_sample_path
+        replacements, vocals_path, no_vocals_path, voice_sample_path,
+        mix_path=mp3_path
     )
 
     # Save outputs
