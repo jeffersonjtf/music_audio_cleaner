@@ -483,9 +483,12 @@ def transcribe_with_timestamps(mp3_path, model_size="base"):
     return result["text"], words
 
 
-def separate_vocals(mp3_path):
+def separate_vocals(mp3_path, song_dir=None):
     """Use demucs Python API to separate vocals from accompaniment.
-    Saves output with soundfile to avoid torchaudio.save() / torchcodec issues."""
+    Saves output with soundfile to avoid torchaudio.save() / torchcodec issues.
+
+    song_dir: base folder for this song's outputs. Defaults to mp3_path.parent.
+    """
     import torch
     from demucs.pretrained import get_model
     from demucs.apply import apply_model
@@ -493,7 +496,8 @@ def separate_vocals(mp3_path):
 
     print("Separating vocals from instruments with demucs...")
     mp3_path = Path(mp3_path)
-    out_dir = mp3_path.parent / "demucs_output" / mp3_path.stem
+    base = Path(song_dir) if song_dir else mp3_path.parent
+    out_dir = base / "demucs_output" / mp3_path.stem
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # Check if already separated (skip if so)
@@ -533,10 +537,26 @@ def separate_vocals(mp3_path):
     return vocals_path, no_vocals_path
 
 
-def extract_voice_sample(vocals_path, words, replacements, target_duration=30.0):
+def extract_voice_sample(vocals_path, words, replacements, target_duration=30.0,
+                         output_path=None):
     """Extract multiple clean vocal segments (avoiding target words) for voice cloning.
     Combines 3-4 segments from different parts of the song, totaling ~30s.
-    More variety = better clone (singer at different pitches, intensities)."""
+    More variety = better clone (singer at different pitches, intensities).
+
+    output_path: if provided, save to this path. Also checked for an existing cache —
+    if the file exists and is longer than 10s, it is returned immediately.
+    """
+    # Cache hit: skip extraction if saved reference already exists
+    if output_path is not None:
+        p = Path(output_path)
+        if p.exists():
+            try:
+                info_cached = sf.info(str(p))
+                if info_cached.duration >= 10.0:
+                    print(f"  Using cached voice clone: {p} ({info_cached.duration:.1f}s)")
+                    return p
+            except Exception:
+                pass  # corrupt file — re-extract
 
     # Build list of time ranges to avoid (target word positions + padding)
     avoid_ranges = []
@@ -626,7 +646,10 @@ def extract_voice_sample(vocals_path, words, replacements, target_duration=30.0)
 
     combined_audio = np.concatenate(combined, axis=0)
 
-    sample_path = Path(vocals_path).parent / "voice_sample.wav"
+    if output_path is not None:
+        sample_path = Path(output_path)
+    else:
+        sample_path = Path(vocals_path).parent / "voice_sample.wav"
     sf.write(str(sample_path), combined_audio, sr)
     print(f"  Total voice sample: {collected:.1f}s -> {sample_path}")
     return sample_path
@@ -680,7 +703,7 @@ def clone_voice_word(text, voice_sample_path, vocals_path, start_s, end_s, durat
     for mp3_bytes, full_audio in wrapper.convert_voice(
         source=tts_for_vc_path,
         target=str(voice_sample_path),
-        diffusion_steps=10,         # was 10 — higher = much better voice quality
+        diffusion_steps=5,         # was 10 — higher = much better voice quality
         length_adjust=1.0,
         inference_cfg_rate=0.7,
         f0_condition=True,
@@ -1706,7 +1729,7 @@ def verify_only(mp3_path, words_path):
     Requires the *_timestamps.json sidecar written during the full pipeline run.
     No models are loaded — just audio math against the existing clean file."""
     stem      = mp3_path.stem
-    out_dir   = mp3_path.parent
+    out_dir   = mp3_path.parent  # song_dir — all outputs live here
     clean_mp3 = out_dir / f"{stem}_clean.mp3"
     ts_file   = out_dir / f"{stem}_timestamps.json"
 
@@ -1741,7 +1764,7 @@ def verify_only(mp3_path, words_path):
 
     # Load original vocals (cached by demucs) for word-accurate F0 reference
     import librosa
-    orig_vocals_path = out_dir / "demucs_output" / mp3_path.stem / "vocals.wav"
+    orig_vocals_path = out_dir / "demucs_output" / stem / "vocals.wav"
     vocals_np = None
     vocals_sr = None
     if orig_vocals_path.exists():
@@ -1783,6 +1806,170 @@ def verify_only(mp3_path, words_path):
     print("=" * 60)
 
 
+def _group_words_into_lines(words, gap_s=0.6):
+    """Group Whisper word dicts into lyric lines separated by silence gaps >= gap_s."""
+    if not words:
+        return []
+    lines = []
+    current = [words[0]]
+    for w in words[1:]:
+        gap = w["start"] - current[-1]["end"]
+        if gap >= gap_s:
+            lines.append(current)
+            current = [w]
+        else:
+            current.append(w)
+    if current:
+        lines.append(current)
+    return lines
+
+
+def _align_official_lyrics(official_text, whisper_lines):
+    """Try to match official lyric lines to Whisper groups by edit distance.
+
+    Returns a list of (text, start_s, end_s) tuples — official text if match
+    confidence >= 0.6, else Whisper text. official_lyrics is optional and the
+    function degrades gracefully when lines don't match.
+    """
+    from difflib import SequenceMatcher
+
+    official_lines = [l.strip() for l in official_text.splitlines() if l.strip()]
+    result = []
+
+    oi = 0  # pointer into official_lines
+    for wline in whisper_lines:
+        w_text  = " ".join(w["word"] for w in wline).strip()
+        start_s = wline[0]["start"]
+        end_s   = wline[-1]["end"]
+
+        # Try to find the best-matching official line near the current pointer
+        best_ratio = 0.0
+        best_text  = w_text
+        window = official_lines[oi:oi + 6]  # look ahead up to 6 official lines
+        for j, ol in enumerate(window):
+            ratio = SequenceMatcher(None, w_text.lower(), ol.lower()).ratio()
+            if ratio > best_ratio:
+                best_ratio = ratio
+                best_text  = ol
+                best_j     = oi + j
+
+        if best_ratio >= 0.6:
+            oi = best_j + 1
+            result.append((best_text, start_s, end_s))
+        else:
+            result.append((w_text, start_s, end_s))
+
+    return result
+
+
+def resing_song(words, vocals_path, no_vocals_path, voice_sample_path, song_dir,
+                official_lyrics_path=None):
+    """Synthesize the entire transcribed lyrics in the singer's cloned voice,
+    aligned to original timing with F0 melody transferred from the original vocals.
+
+    Outputs:
+      song_dir/resing/<stem>_resing_vocals.wav  — vocals only
+      song_dir/resing/<stem>_resing_mix.mp3     — full mix with accompaniment
+    """
+    import librosa
+
+    vocals_path   = Path(vocals_path)
+    no_vocals_path = Path(no_vocals_path)
+    song_dir      = Path(song_dir)
+    stem          = vocals_path.parent.parent.name  # demucs_output/<stem>/vocals.wav
+    # Better: infer stem from the mp3 that produced these paths
+    # vocals_path is song_dir/demucs_output/<stem>/vocals.wav
+    stem = vocals_path.parent.name
+
+    resing_dir = song_dir / "resing"
+    resing_dir.mkdir(exist_ok=True)
+
+    out_vocals = resing_dir / f"{stem}_resing_vocals.wav"
+    out_mix    = resing_dir / f"{stem}_resing_mix.mp3"
+
+    print("\n" + "=" * 60)
+    print("RE-SING PIPELINE")
+    print("=" * 60)
+
+    # Load official lyrics if present
+    official_text = None
+    if official_lyrics_path and Path(official_lyrics_path).exists():
+        official_text = Path(official_lyrics_path).read_text(encoding="utf-8")
+        print(f"  Using official lyrics: {official_lyrics_path}")
+    else:
+        print("  No official_lyrics.txt — using Whisper transcript only.")
+
+    # Group words into lyric lines
+    lines = _group_words_into_lines(words)
+    print(f"  {len(lines)} lyric lines detected.")
+
+    # Align with official lyrics if available
+    if official_text:
+        line_data = _align_official_lyrics(official_text, lines)
+    else:
+        line_data = [
+            (" ".join(w["word"] for w in line).strip(), line[0]["start"], line[-1]["end"])
+            for line in lines
+        ]
+
+    # Load original vocals for F0 reference
+    print("  Loading original vocals for F0 melody reference...")
+    vocals_np, vocals_sr = librosa.load(str(vocals_path), sr=None, mono=True)
+
+    # Load accompaniment to get song duration
+    accompaniment = AudioSegment.from_wav(str(no_vocals_path))
+    song_ms = len(accompaniment)
+
+    # Build a silent canvas for the full re-sung vocal track
+    resing_track = AudioSegment.silent(duration=song_ms,
+                                       frame_rate=accompaniment.frame_rate)
+
+    print(f"\nSynthesizing {len(line_data)} lines...\n")
+
+    for i, (text, start_s, end_s) in enumerate(line_data):
+        if not text.strip():
+            continue
+        duration_ms = max(200, int((end_s - start_s) * 1000))
+        print(f"  Line {i + 1}/{len(line_data)}: [{start_s:.2f}s-{end_s:.2f}s] \"{text}\"")
+
+        line_audio = clone_voice_word(
+            text, voice_sample_path, vocals_path,
+            start_s, end_s, duration_ms
+        )
+
+        # F0 contour transfer: pass original vocals at this window
+        y_line, sr_line = _seg_to_np(line_audio)
+        y_orig_window = vocals_np[int(start_s * vocals_sr):int(end_s * vocals_sr)]
+        if len(y_orig_window) >= 2048 and len(y_line) >= 2048:
+            y_line = _transfer_f0_contour(y_line, sr_line, y_orig_window, vocals_sr)
+            y_line = _spectral_match(y_line, y_orig_window, sr_line)
+            line_audio = _np_to_seg(y_line, sr_line)
+
+        # Match sample rate to track
+        if line_audio.frame_rate != resing_track.frame_rate:
+            line_audio = line_audio.set_frame_rate(resing_track.frame_rate)
+
+        # Equal-power fade edges to avoid clicks
+        line_audio = _apply_crossfade(line_audio, fade_ms=20)
+
+        # Place at original timestamp
+        pos_ms = max(0, int(start_s * 1000))
+        resing_track = resing_track.overlay(line_audio, position=pos_ms)
+
+    print("\nExporting re-sung vocals...")
+    resing_track.export(str(out_vocals), format="wav")
+    print(f"  Vocals: {out_vocals}")
+
+    print("Mixing re-sung vocals with accompaniment...")
+    min_len = min(len(resing_track), len(accompaniment))
+    mix = accompaniment[:min_len].overlay(resing_track[:min_len])
+    mix.export(str(out_mix), format="mp3", bitrate="192k")
+    print(f"  Mix:    {out_mix}")
+
+    print("\nRe-sing complete.")
+    return out_vocals, out_mix
+
+
 def replace_words_text(text, pairs):
     """Replace target words in text, preserving case."""
     cleaned = text
@@ -1805,16 +1992,22 @@ def main():
 
     args = sys.argv[1:]
     verify_mode = "--verify" in args
-    args = [a for a in args if a != "--verify"]
+    resing_mode = "--resing" in args
+    args = [a for a in args if a not in ("--verify", "--resing")]
 
     if not args:
-        print("Usage: python lyrics_cleaner.py <song.mp3> [targetwords.txt] [model_size] [--verify]")
+        print("Usage: python lyrics_cleaner.py <song.mp3> [targetwords.txt] [model_size] [--verify] [--resing]")
         print()
         print("  song.mp3         Path to the original MP3 file")
-        print("  targetwords.txt  Path to target words CSV (default: targetwords.txt)")
+        print("  targetwords.txt  Optional path to target words CSV")
+        print("                   Default: <song_folder>/targetwords.txt, then ./targetwords.txt")
         print("  model_size       Whisper model: tiny, base, small, medium, large (default: base)")
-        print("  --verify         Re-run only the 9-metric verification against an existing")
+        print("  --verify         Re-run only the 10-metric verification against an existing")
         print("                   *_clean.mp3 (uses cached *_timestamps.json — no models loaded)")
+        print("  --resing         Also synthesize the full song in the singer's cloned voice")
+        print()
+        print("Folder layout: organize your library as Artist/Album/Song/<song>.mp3")
+        print("  Each song folder can contain its own targetwords.txt and optional official_lyrics.txt")
         sys.exit(1)
 
     mp3_path = Path(args[0])
@@ -1822,12 +2015,29 @@ def main():
         print(f"Error: File not found: {mp3_path}")
         sys.exit(1)
 
-    words_path = Path(args[1]) if len(args) > 1 else Path("targetwords.txt")
+    # song_dir is the folder containing the MP3 — all outputs go here
+    song_dir = mp3_path.parent
+    stem     = mp3_path.stem
+
+    # targetwords.txt: prefer song_dir, fall back to project root
+    if len(args) > 1:
+        words_path = Path(args[1])
+    elif (song_dir / "targetwords.txt").exists():
+        words_path = song_dir / "targetwords.txt"
+    else:
+        words_path = Path("targetwords.txt")
+
     if not words_path.exists():
         print(f"Error: Target words file not found: {words_path}")
+        print(f"  Looked in: {song_dir / 'targetwords.txt'} and ./targetwords.txt")
         sys.exit(1)
 
     model_size = args[2] if len(args) > 2 else "base"
+
+    # Optional official lyrics reference (improves re-sing text quality)
+    official_lyrics_path = song_dir / "official_lyrics.txt"
+    if official_lyrics_path.exists():
+        print(f"  Found official_lyrics.txt: {official_lyrics_path}")
 
     # --verify: skip all model loading, just verify the existing clean file
     if verify_mode:
@@ -1842,9 +2052,7 @@ def main():
     lyrics, words = transcribe_with_timestamps(mp3_path, model_size)
 
     # Cache timestamps so --verify can run later without re-transcribing
-    stem = mp3_path.stem
-    output_dir = mp3_path.parent
-    timestamps_file = output_dir / f"{stem}_timestamps.json"
+    timestamps_file = song_dir / f"{stem}_timestamps.json"
     save_timestamps(words, timestamps_file)
 
     print()
@@ -1863,16 +2071,27 @@ def main():
     print("=" * 60)
     print(cleaned_text)
 
+    # Step 3: Separate vocals from instruments (outputs go inside song_dir)
+    vocals_path, no_vocals_path = separate_vocals(mp3_path, song_dir=song_dir)
+
+    # Step 4: Build / load full voice clone (30s reference, cached in cloned_voice/)
+    clone_dir      = song_dir / "cloned_voice"
+    clone_dir.mkdir(exist_ok=True)
+    voice_ref_path = clone_dir / "voice_reference.wav"
+
+    print("\nBuilding voice clone (30s reference)...")
+    voice_sample_path = extract_voice_sample(
+        vocals_path, words, replacements,
+        output_path=voice_ref_path
+    )
+
     if not replacements:
-        print("\nNo target words found in the audio. Nothing to do.")
+        print("\nNo target words found in the audio.")
+        if resing_mode:
+            resing_song(words, vocals_path, no_vocals_path, voice_sample_path,
+                        song_dir, official_lyrics_path=official_lyrics_path
+                        if official_lyrics_path.exists() else None)
         return
-
-    # Step 3: Separate vocals from instruments
-    vocals_path, no_vocals_path = separate_vocals(mp3_path)
-
-    # Step 4: Extract a clean voice sample for cloning
-    print("\nExtracting voice sample for cloning...")
-    voice_sample_path = extract_voice_sample(vocals_path, words, replacements)
 
     # Step 5: Build cleaned audio with voice-cloned replacements
     cleaned_audio, cleaned_vocals = build_clean_audio(
@@ -1880,11 +2099,11 @@ def main():
         mix_path=mp3_path
     )
 
-    # Save outputs
-    original_txt       = output_dir / f"{stem}_original.txt"
-    cleaned_txt_file   = output_dir / f"{stem}_cleaned.txt"
-    cleaned_mp3        = output_dir / f"{stem}_clean.mp3"
-    cleaned_vocals_wav = output_dir / f"{stem}_vocals_clean.wav"
+    # Save outputs into song_dir
+    original_txt       = song_dir / f"{stem}_original.txt"
+    cleaned_txt_file   = song_dir / f"{stem}_cleaned.txt"
+    cleaned_mp3        = song_dir / f"{stem}_clean.mp3"
+    cleaned_vocals_wav = song_dir / f"{stem}_vocals_clean.wav"
 
     original_txt.write_text(lyrics, encoding="utf-8")
     cleaned_txt_file.write_text(cleaned_text, encoding="utf-8")
@@ -1893,16 +2112,24 @@ def main():
     cleaned_audio.export(str(cleaned_mp3), format="mp3", bitrate="192k")
 
     # Save isolated vocals sidecar so --verify can do accurate F0 checks
-    # (full mix contains instruments which corrupt pitch detection)
     cleaned_vocals.export(str(cleaned_vocals_wav), format="wav")
 
     print()
     print("=" * 60)
     print("DONE")
     print("=" * 60)
+    print(f"Song folder:     {song_dir}")
     print(f"Original lyrics: {original_txt}")
     print(f"Cleaned lyrics:  {cleaned_txt_file}")
     print(f"Cleaned MP3:     {cleaned_mp3}")
+    print(f"Voice clone:     {voice_ref_path}")
+
+    # Optional: re-sing the full song in the cloned voice
+    if resing_mode:
+        resing_song(words, vocals_path, no_vocals_path, voice_sample_path,
+                    song_dir,
+                    official_lyrics_path=official_lyrics_path
+                    if official_lyrics_path.exists() else None)
 
 
 if __name__ == "__main__":

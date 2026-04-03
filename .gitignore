@@ -11,3 +11,4 @@ demucs_output/
 *_timestamps.json
 *_vocals_clean.wav
 logs/
+library/
