@@ -269,6 +269,46 @@ def _phonetic_score(target: str, replacement: str) -> dict:
             "target_vowel": t_vowel, "repl_vowel": r_vowel}
 
 
+# ARPAbet vowels that sustain naturally in singing (mouth stays open, pitch is stable)
+_OPEN_VOWELS    = {"AA", "AW", "AH", "AO"}  # wide open — easiest to hold
+_MID_VOWELS     = {"AE", "EH", "EY", "IH", "OW", "OY", "UH", "UW", "IY"}  # partially open
+# Consonant codas that resonate and fade naturally rather than stopping abruptly
+_RESONANT_CODA  = {"M", "N", "NG", "L", "R"}
+
+
+def _singability_score(word: str) -> int:
+    """Score 0–3: how naturally this word can be sustained/elongated in a sung melody.
+
+    +2 for an open/back stressed vowel (AA/AW/AH/AO) — wide mouth, stable pitch.
+    +1 for a mid vowel (EH/EY/OW/…).
+    +1 if the word ends in a nasal or liquid consonant (M/N/NG/L/R) — resonant decay.
+
+    Used as a tiebreaker in _find_best_replacement so phonetically equal candidates
+    are ranked by musical naturalness.
+    """
+    import pronouncing
+    phones = pronouncing.phones_for_word(word.lower())
+    if not phones:
+        return 0
+    p = phones[0]
+    sv = _get_stressed_vowel(p)  # e.g. "AH", "OW", None
+    # Strip stress digit for comparison
+    sv_base = sv.rstrip("012") if sv else None
+
+    vowel_pts = 0
+    if sv_base in _OPEN_VOWELS:
+        vowel_pts = 2
+    elif sv_base in _MID_VOWELS:
+        vowel_pts = 1
+
+    # Last phoneme token (strip stress digit)
+    phone_list = p.split()
+    last = phone_list[-1].rstrip("012") if phone_list else ""
+    coda_pts = 1 if last in _RESONANT_CODA else 0
+
+    return vowel_pts + coda_pts
+
+
 def _find_best_replacement(target: str) -> tuple[str, dict]:
     """Auto-select the best child-friendly, phonetically-matched replacement
     from the CMU Pronouncing Dictionary.
@@ -304,8 +344,8 @@ def _find_best_replacement(target: str) -> tuple[str, dict]:
             scored.append((sc["score"], w, sc))
 
     if scored:
-        # Sort by score desc, then alphabetically for stability
-        scored.sort(key=lambda x: (-x[0], x[1]))
+        # Sort by phonetic score desc, then singability desc, then alphabetically for stability
+        scored.sort(key=lambda x: (-x[0], -_singability_score(x[1]), x[1]))
         _, best_word, best_sc = scored[0]
         return (best_word, best_sc)
 
@@ -671,18 +711,12 @@ def clone_voice_word(text, voice_sample_path, vocals_path, start_s, end_s, durat
     # Step 5: Spectral matching — match EQ/timbre to original recording context
     vc_trimmed = _spectral_match(vc_trimmed, y_orig, vc_sr)
 
-    # Step 6: Single time-stretch to exact target duration (only one pass total)
+    # Step 6: Vowel-nucleus-aware time stretch to exact target duration.
+    # Stretches only the vowel nucleus, keeping consonant onset/coda at natural speed.
+    # Falls back to whole-word stretch for very short clips.
     target_samples_vc = int(duration_ms * vc_sr / 1000)
     if target_samples_vc > 0 and len(vc_trimmed) > 0:
-        stretch_factor = len(vc_trimmed) / target_samples_vc
-        stretch_factor = max(0.5, min(3.0, stretch_factor))
-        if abs(stretch_factor - 1.0) > 0.05:
-            vc_trimmed = librosa.effects.time_stretch(vc_trimmed, rate=stretch_factor)
-
-    if len(vc_trimmed) < target_samples_vc:
-        vc_trimmed = np.pad(vc_trimmed, (0, target_samples_vc - len(vc_trimmed)))
-    else:
-        vc_trimmed = vc_trimmed[:target_samples_vc]
+        vc_trimmed = _vowel_stretch(vc_trimmed, vc_sr, target_samples_vc)
 
     # Convert to AudioSegment
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
@@ -692,6 +726,99 @@ def clone_voice_word(text, voice_sample_path, vocals_path, start_s, end_s, durat
     Path(tmp_path).unlink(missing_ok=True)
 
     return result
+
+
+def _vowel_stretch(y, sr, target_samples):
+    """Stretch only the vowel nucleus of y to reach target_samples.
+
+    A sung word is structured as:  consonant_onset | vowel_nucleus | consonant_coda
+    Singers elongate the vowel, not the consonants. Stretching the whole word smears
+    the consonant attacks. This function:
+      1. Locates the vowel nucleus using a sliding-window RMS/ZCR heuristic
+         (vowels = high energy, low zero-crossing rate)
+      2. Keeps onset and coda at their natural durations (clamped ≤ 80ms each)
+      3. Stretches only the nucleus to fill the remaining sample budget
+      4. Falls back to whole-word stretch if the clip is too short or heuristic fails
+    """
+    import librosa
+
+    MIN_SAMPLES = 2048
+    MAX_CONS_MS = 80  # ms — max consonant onset/coda kept at natural speed
+    max_cons = int(MAX_CONS_MS * sr / 1000)
+
+    # --- Fallback: whole-word stretch ---
+    def _whole_stretch(y, target_samples):
+        if len(y) == 0 or target_samples <= 0:
+            return y
+        rate = max(0.25, min(4.0, len(y) / target_samples))
+        if abs(rate - 1.0) <= 0.05:
+            pass
+        else:
+            y = librosa.effects.time_stretch(y, rate=rate)
+        if len(y) < target_samples:
+            y = np.pad(y, (0, target_samples - len(y)))
+        return y[:target_samples].astype(np.float32)
+
+    if len(y) < MIN_SAMPLES or target_samples <= 0:
+        return _whole_stretch(y, target_samples)
+
+    # --- Sliding window RMS and ZCR ---
+    win = int(0.030 * sr)  # 30ms window
+    hop = win // 4
+    n_frames = max(1, (len(y) - win) // hop + 1)
+
+    rms_curve = np.array([
+        np.sqrt(np.mean(y[i * hop: i * hop + win] ** 2))
+        for i in range(n_frames)
+    ])
+    zcr_curve = np.array([
+        float(np.mean(np.abs(np.diff(np.sign(y[i * hop: i * hop + win])))) / 2)
+        for i in range(n_frames)
+    ])
+
+    # Normalize both curves to [0, 1]
+    rms_n = (rms_curve - rms_curve.min()) / (rms_curve.max() - rms_curve.min() + 1e-9)
+    zcr_n = (zcr_curve - zcr_curve.min()) / (zcr_curve.max() - zcr_curve.min() + 1e-9)
+
+    # Vowel score: high RMS, low ZCR
+    vowel_score = rms_n - 0.5 * zcr_n
+
+    # Find the peak vowel frame and expand outward while score stays above 0.2
+    peak = int(np.argmax(vowel_score))
+    lo, hi = peak, peak
+    while lo > 0 and vowel_score[lo - 1] > 0.20:
+        lo -= 1
+    while hi < n_frames - 1 and vowel_score[hi + 1] > 0.20:
+        hi += 1
+
+    nucleus_start = min(lo * hop, len(y))
+    nucleus_end   = min(hi * hop + win, len(y))
+
+    # Clamp onset and coda to max_cons samples
+    onset_end   = min(nucleus_start, max_cons)
+    coda_start  = max(nucleus_end, len(y) - max_cons)
+
+    onset  = y[:onset_end]
+    nucleus = y[onset_end:coda_start]
+    coda   = y[coda_start:]
+
+    if len(nucleus) < 512:
+        # Nucleus too short — fall back
+        return _whole_stretch(y, target_samples)
+
+    # Stretch nucleus to fill the budget left after fixed onset + coda
+    vowel_budget = target_samples - len(onset) - len(coda)
+    if vowel_budget <= 0:
+        return _whole_stretch(y, target_samples)
+
+    vowel_rate = max(0.25, min(4.0, len(nucleus) / vowel_budget))
+    if abs(vowel_rate - 1.0) > 0.05:
+        nucleus = librosa.effects.time_stretch(nucleus, rate=vowel_rate)
+
+    result = np.concatenate([onset, nucleus, coda]).astype(np.float32)
+    if len(result) < target_samples:
+        result = np.pad(result, (0, target_samples - len(result)))
+    return result[:target_samples].astype(np.float32)
 
 
 def _eq_power_curve(n, fade_in=True):
