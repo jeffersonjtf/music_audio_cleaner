@@ -4,39 +4,70 @@ import csv
 import re
 import tempfile
 import os
+import logging
 from pathlib import Path
 from datetime import datetime
 
 
-class _Tee:
-    """Mirror stdout to terminal (verbatim) and log file (with per-line timestamps)."""
+class _PrintToLogger:
+    """Redirect sys.stdout.write() to logger.info() so every print() line is
+    timestamped and written to both the terminal and the log file."""
 
-    def __init__(self, terminal, log_fh):
-        self._terminal = terminal
-        self._log_fh   = log_fh
-        self._buf      = ""  # partial-line buffer for timestamp stamping
+    def __init__(self, logger):
+        self._logger = logger
+        self._buf    = ""
 
     def write(self, data):
-        self._terminal.write(data)
         self._buf += data
         while "\n" in self._buf:
             line, self._buf = self._buf.split("\n", 1)
-            ts = datetime.now().strftime("%H:%M:%S.%f")[:12]  # HH:MM:SS.mmm
-            self._log_fh.write(f"[{ts}] {line}\n")
+            self._logger.info(line)
 
     def flush(self):
-        self._terminal.flush()
-        self._log_fh.flush()
+        pass  # logging handlers manage their own flushing
 
 
 def _setup_logging():
+    """Configure logging to file + console, replicating the ABG project strategy.
+
+    Both handlers use [%(asctime)s] %(message)s so timestamps appear on the
+    terminal AND in the log file.  logging.FileHandler flushes after every
+    record — no silent buffering.
+    """
     logs_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
     os.makedirs(logs_dir, exist_ok=True)
-    now  = datetime.now()
-    path = os.path.join(logs_dir, f"terminal_{now.strftime('%Y-%m-%d_%H%M%S')}.log")
-    log_fh = open(path, "w", encoding="utf-8")
-    sys.stdout = _Tee(sys.__stdout__, log_fh)
-    return path, log_fh
+    now      = datetime.now()
+    log_path = os.path.join(logs_dir, f"terminal_{now.strftime('%Y-%m-%d_%H%M%S')}.log")
+
+    logger = logging.getLogger("lyrics_cleaner")
+    logger.setLevel(logging.DEBUG)
+    if logger.handlers:
+        logger.handlers.clear()
+
+    fmt = logging.Formatter("[%(asctime)s] %(message)s", datefmt="%H:%M:%S")
+
+    # File handler — always DEBUG; flushes to disk after every record
+    fh = logging.FileHandler(log_path, encoding="utf-8")
+    fh.setLevel(logging.DEBUG)
+    fh.setFormatter(fmt)
+    logger.addHandler(fh)
+
+    # Console handler — writes to the real stdout (pre-redirect) so it always works
+    ch = logging.StreamHandler(sys.__stdout__)
+    ch.setLevel(logging.DEBUG)
+    ch.setFormatter(fmt)
+    logger.addHandler(ch)
+
+    logger.propagate = False
+
+    # Redirect sys.stdout so every print() call goes through logger.info()
+    sys.stdout = _PrintToLogger(logger)
+    return log_path, logger
+
+
+# Set up logging immediately at module level so ensure_dependencies() output
+# is captured (it runs before main() is called).
+_log_path, _logger = _setup_logging()
 
 
 def ensure_dependencies():
@@ -1592,8 +1623,7 @@ def replace_words_text(text, pairs):
 
 
 def main():
-    log_path, _log_fh = _setup_logging()
-    print(f"Logging to: {log_path}")
+    print(f"Logging to: {_log_path}")
 
     args = sys.argv[1:]
     verify_mode = "--verify" in args
