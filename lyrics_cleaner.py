@@ -640,7 +640,7 @@ def clone_voice_word(text, voice_sample_path, vocals_path, start_s, end_s, durat
     for mp3_bytes, full_audio in wrapper.convert_voice(
         source=tts_for_vc_path,
         target=str(voice_sample_path),
-        diffusion_steps=30,         # was 10 — higher = much better voice quality
+        diffusion_steps=10,         # was 10 — higher = much better voice quality
         length_adjust=1.0,
         inference_cfg_rate=0.7,
         f0_condition=True,
@@ -868,6 +868,36 @@ def _auto_correct(repl_np, sr, metrics, vocals_ctx, mute_start_ms, mute_end_ms, 
         y = y * gain
 
     return y.astype(np.float32)
+
+
+def _blend_harmonic_bed(repl_seg, accompaniment, mute_start, mute_end, bed_gain_db=-24):
+    """Blend a quiet copy of the accompaniment at [mute_start:mute_end] into repl_seg.
+
+    The replacement word inherits the harmonic/ambient texture of the original
+    recording environment (instrument reflections, room reverb, harmonic overtones)
+    so it no longer sounds like dry synthesis pasted into a live mix.
+
+    bed_gain_db: -30 = very subtle / -24 = default presence / -18 = noticeable.
+    """
+    bed = accompaniment[mute_start:mute_end]
+
+    # Match length to replacement (trim long or pad short with silence)
+    if len(bed) > len(repl_seg):
+        bed = bed[:len(repl_seg)]
+    elif len(bed) < len(repl_seg):
+        bed = bed + AudioSegment.silent(duration=len(repl_seg) - len(bed),
+                                        frame_rate=bed.frame_rate)
+
+    # Match audio properties to repl_seg
+    if bed.frame_rate != repl_seg.frame_rate:
+        bed = bed.set_frame_rate(repl_seg.frame_rate)
+    if bed.channels != repl_seg.channels:
+        bed = bed.set_channels(repl_seg.channels)
+    if bed.sample_width != repl_seg.sample_width:
+        bed = bed.set_sample_width(repl_seg.sample_width)
+
+    bed = bed.apply_gain(bed_gain_db)
+    return repl_seg.overlay(bed)
 
 
 def _mean_f0_correct_fallback(y_vc, sr_vc, y_orig, sr_orig):
@@ -1467,11 +1497,24 @@ def build_clean_audio(replacements, vocals_path, no_vocals_path, voice_sample_pa
         if mix_np is not None and mix_sr is not None:
             mix_word_np = mix_np[int(snapped_start * mix_sr):int(snapped_end * mix_sr)]
 
+        # Bed gain candidates: start at -24 dB, explore ±3 dB each round
+        _BED_GAINS = [-24, -27, -21, -30, -18, -33]
+
+        best_candidate = None
+        best_warn      = 999
+
         for attempt in range(_MAX_CORRECTION_ROUNDS + 1):
-            # Convert corrected numpy back to AudioSegment; resample to vocals rate if needed
+            # Convert corrected numpy back to AudioSegment
             repl_seg = _np_to_seg(repl_np, sr_vc)
             if repl_seg.frame_rate != vocals_before_word.frame_rate:
                 repl_seg = repl_seg.set_frame_rate(vocals_before_word.frame_rate)
+
+            # Blend harmonic bed at this round's gain level
+            bed_gain = _BED_GAINS[min(attempt, len(_BED_GAINS) - 1)]
+            repl_seg = _blend_harmonic_bed(
+                repl_seg, accompaniment, mute_start, mute_end,
+                bed_gain_db=bed_gain
+            )
 
             # Splice into a candidate vocals track (non-destructive — base is unchanged)
             vocals_candidate = _apply_splice(
@@ -1485,17 +1528,25 @@ def build_clean_audio(replacements, vocals_path, no_vocals_path, voice_sample_pa
                 orig_word_np=orig_word_np, fade_ms=fade_ms,
                 mix_word_np=mix_word_np
             )
-            round_label = "initial" if attempt == 0 else f"round {attempt}"
+            round_label = f"initial bed {bed_gain}dB" if attempt == 0 else f"round {attempt} bed {bed_gain}dB"
             _print_verification(metrics, r["replacement"],
                                 phonetic_score=r.get("phonetic_score"),
                                 round_label=round_label)
 
+            # Track best result across all rounds
+            if metrics["warn_count"] < best_warn:
+                best_warn      = metrics["warn_count"]
+                best_candidate = vocals_candidate
+
             if metrics["verdict"] == "PASS" or attempt == _MAX_CORRECTION_ROUNDS:
-                vocals = vocals_candidate
+                vocals = best_candidate
+                if attempt == _MAX_CORRECTION_ROUNDS and metrics["verdict"] != "PASS":
+                    print(f"    Best result across {attempt + 1} rounds: {best_warn} warning(s).")
                 break
 
             # Apply targeted corrections to the numpy replacement for next round
-            print(f"    Auto-correcting ({round_label} → round {attempt + 1})...")
+            round_label_short = "initial" if attempt == 0 else f"round {attempt}"
+            print(f"    Auto-correcting ({round_label_short} → round {attempt + 1})...")
             repl_np = _auto_correct(
                 repl_np, sr_vc, metrics, vocals_before_word,
                 mute_start, mute_end, fade_ms
