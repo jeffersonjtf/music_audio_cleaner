@@ -1863,7 +1863,7 @@ def _align_official_lyrics(official_text, whisper_lines):
 
 
 def resing_song(words, vocals_path, no_vocals_path, voice_sample_path, song_dir,
-                official_lyrics_path=None):
+                official_lyrics_path=None, cleaned_lyrics_path=None):
     """Synthesize the entire transcribed lyrics in the singer's cloned voice,
     aligned to original timing with F0 melody transferred from the original vocals.
 
@@ -1891,21 +1891,28 @@ def resing_song(words, vocals_path, no_vocals_path, voice_sample_path, song_dir,
     print("RE-SING PIPELINE")
     print("=" * 60)
 
-    # Load official lyrics if present
-    official_text = None
-    if official_lyrics_path and Path(official_lyrics_path).exists():
-        official_text = Path(official_lyrics_path).read_text(encoding="utf-8")
-        print(f"  Using official lyrics: {official_lyrics_path}")
-    else:
-        print("  No official_lyrics.txt — using Whisper transcript only.")
-
-    # Group words into lyric lines
+    # Group words into lyric lines (used for timing regardless of text source)
     lines = _group_words_into_lines(words)
     print(f"  {len(lines)} lyric lines detected.")
 
-    # Align with official lyrics if available
-    if official_text:
-        line_data = _align_official_lyrics(official_text, lines)
+    # Text source priority:
+    #   1. _cleaned.txt  — already has replaced words from prior pipeline run
+    #   2. official_lyrics.txt — reference, may still contain dirty words
+    #   3. Raw Whisper transcript — fallback
+    text_source = None
+    text_label  = "Whisper transcript"
+
+    if cleaned_lyrics_path and Path(cleaned_lyrics_path).exists():
+        text_source = Path(cleaned_lyrics_path).read_text(encoding="utf-8")
+        text_label  = f"cleaned lyrics ({Path(cleaned_lyrics_path).name})"
+    elif official_lyrics_path and Path(official_lyrics_path).exists():
+        text_source = Path(official_lyrics_path).read_text(encoding="utf-8")
+        text_label  = f"official lyrics ({Path(official_lyrics_path).name})"
+
+    print(f"  Text source: {text_label}")
+
+    if text_source:
+        line_data = _align_official_lyrics(text_source, lines)
     else:
         line_data = [
             (" ".join(w["word"] for w in line).strip(), line[0]["start"], line[-1]["end"])
@@ -2048,6 +2055,30 @@ def main():
     pairs = load_target_words(words_path)
     print(f"Loaded {len(pairs)} target word(s) from {words_path}")
 
+    cleaned_txt_file   = song_dir / f"{stem}_cleaned.txt"
+    timestamps_file    = song_dir / f"{stem}_timestamps.json"
+
+    # --resing fast path: if cleaned lyrics + timestamps + demucs cache all exist,
+    # skip the full replacement pipeline and go straight to re-singing.
+    if resing_mode:
+        vocals_path_check    = song_dir / "demucs_output" / stem / "vocals.wav"
+        no_vocals_path_check = song_dir / "demucs_output" / stem / "no_vocals.wav"
+        voice_ref_check      = song_dir / "cloned_voice" / "voice_reference.wav"
+
+        if (cleaned_txt_file.exists() and timestamps_file.exists()
+                and vocals_path_check.exists() and no_vocals_path_check.exists()):
+            print("\nAll cached files found — skipping full pipeline, running re-sing only.")
+            words_cached = load_timestamps(timestamps_file)
+            resing_song(words_cached, vocals_path_check, no_vocals_path_check,
+                        voice_ref_check if voice_ref_check.exists() else vocals_path_check,
+                        song_dir,
+                        cleaned_lyrics_path=cleaned_txt_file,
+                        official_lyrics_path=official_lyrics_path
+                        if official_lyrics_path.exists() else None)
+            return
+
+        print("\nCached files not complete — running full pipeline first to generate them.")
+
     # Step 1: Transcribe with word timestamps
     lyrics, words = transcribe_with_timestamps(mp3_path, model_size)
 
@@ -2089,7 +2120,9 @@ def main():
         print("\nNo target words found in the audio.")
         if resing_mode:
             resing_song(words, vocals_path, no_vocals_path, voice_sample_path,
-                        song_dir, official_lyrics_path=official_lyrics_path
+                        song_dir,
+                        cleaned_lyrics_path=song_dir / f"{stem}_cleaned.txt",
+                        official_lyrics_path=official_lyrics_path
                         if official_lyrics_path.exists() else None)
         return
 
