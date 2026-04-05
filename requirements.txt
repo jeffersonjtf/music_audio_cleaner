@@ -1,7 +1,12 @@
-openai-whisper
-pydub
-demucs
+numpy
+librosa
+scipy
 soundfile
+pydub
+imageio-ffmpeg
+openai-whisper
+demucs
+pronouncing
+transformers==4.44.2
 TTS
 seed-vc
-pronouncing

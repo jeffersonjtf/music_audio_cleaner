@@ -239,3 +239,68 @@ After each word is replaced, the pipeline runs `_verify_replacement()` which tak
 | VC quality | 10 diffusion steps | 30 diffusion steps |
 | Reverb tail | Trimmed at -30 dB | Preserved at -50 dB |
 | Stretch passes | 2 (pre-VC + post-VC) | 1 (post-VC only) |
+
+---
+
+## Additional Features
+
+### Harmonic Bed Blending
+
+**Function:** `_blend_harmonic_bed()`
+
+The accompaniment track is overlaid into the replacement clip at a low gain (starting at -24 dB, explored ±3 dB each correction round via `_BED_GAINS`). This adds the song's harmonic content to the replacement, reducing the "pasted on" quality.
+
+---
+
+### Singability Scoring + Vowel-Nucleus Time Stretch
+
+**Functions:** `_singability_score()`, `_vowel_stretch()`
+
+Words with open vowels (AA, AW, AH, AO) score higher for singability. The time-stretch is applied only to the vowel nucleus of the word (detected by a sliding 30ms RMS/ZCR window), keeping consonant attacks short (≤80ms) and stretching only the part of the word that is actually sung.
+
+---
+
+### 5-Round Auto-Correction Loop
+
+**Function:** `_auto_correct()` inside `build_clean_audio()`
+
+After each splice, the 9-metric verification runs. If the verdict is not PASS, the loop adjusts F0, spectral balance, splice ramps, or RMS and re-splices. Up to 5 correction rounds run; the best result (fewest warnings) is kept regardless of final verdict.
+
+---
+
+### Melody-Clean Pipeline
+
+**Function:** `build_melody_clean()`
+
+Rather than synthesizing a replacement, this approach mutes the target word entirely and remixes the unmodified instrumental through the gap. Musical fades (1000 ms equal-power) are applied to the vocal track on both sides of the gap so the surrounding words trail off and arrive naturally.
+
+This is the **recommended approach** for production use. The voice-clone pipeline, despite all the quality improvements above, produces results described by the project team as *"it's horrible"* — the cloned voice does not convincingly match the original artist.
+
+| Parameter | Value |
+|---|---|
+| Fade-out before gap | 1000 ms equal-power |
+| Fade-in after gap | 1000 ms equal-power |
+| Gap fill | Original `no_vocals.wav` instrumental plays through |
+| Output | `*_melody_clean.mp3` |
+
+---
+
+### Timestamped Logging
+
+**Functions:** `_setup_logging()`, `_PrintToLogger`
+
+All terminal output is routed through Python's `logging` module. Every line is timestamped `[HH:MM:SS]` on both the terminal and a log file (`logs/terminal_DATE_TIME.log`). The console handler uses a UTF-8 `TextIOWrapper` to prevent `UnicodeEncodeError` on Windows cp1252 terminals when printing symbols like ✓ and →.
+
+---
+
+### Song Library Organization
+
+Songs are organized as `library/Artist/Album/Song/<song>.mp3`. Each song folder is self-contained — its own `targetwords.txt`, generated outputs, demucs cache, and voice clone all live there. The `.gitignore` excludes `library/` so audio files are never committed.
+
+---
+
+### Voice Clone Persistence
+
+**Function:** `extract_voice_sample()`
+
+The 30-second voice reference is extracted once and cached at `cloned_voice/voice_reference.wav`. Subsequent runs skip extraction if the file exists and is longer than 10 seconds. This avoids re-analyzing the song on every run.

@@ -52,8 +52,16 @@ def _setup_logging():
     fh.setFormatter(fmt)
     logger.addHandler(fh)
 
-    # Console handler — writes to the real stdout (pre-redirect) so it always works
-    ch = logging.StreamHandler(sys.__stdout__)
+    # Console handler — force UTF-8 so Unicode symbols (✓ →) don't crash on Windows cp1252
+    import io
+    try:
+        console_stream = io.TextIOWrapper(
+            sys.__stdout__.buffer, encoding="utf-8", errors="replace", line_buffering=True
+        )
+    except AttributeError:
+        # Fallback: stdout has no .buffer (e.g. already wrapped or non-standard terminal)
+        console_stream = sys.__stdout__
+    ch = logging.StreamHandler(console_stream)
     ch.setLevel(logging.DEBUG)
     ch.setFormatter(fmt)
     logger.addHandler(ch)
@@ -703,7 +711,7 @@ def clone_voice_word(text, voice_sample_path, vocals_path, start_s, end_s, durat
     for mp3_bytes, full_audio in wrapper.convert_voice(
         source=tts_for_vc_path,
         target=str(voice_sample_path),
-        diffusion_steps=5,         # was 10 — higher = much better voice quality
+        diffusion_steps=1,         # was 10 — higher = much better voice quality
         length_adjust=1.0,
         inference_cfg_rate=0.7,
         f0_condition=True,
@@ -1711,6 +1719,66 @@ def build_clean_audio(replacements, vocals_path, no_vocals_path, voice_sample_pa
     return cleaned, vocals
 
 
+def build_melody_clean(replacements, vocals_path, no_vocals_path, words=None):
+    """Remove target words from the vocal track and remix with the accompaniment.
+
+    No TTS or voice conversion is used.  The target-word region is ducked to
+    silence (with equal-power crossfades so there are no clicks) and the
+    instrumental track fills the gap naturally.
+
+    Returns an AudioSegment of the full remix.
+    Output file name convention: <stem>_melody_clean.mp3
+    """
+    import librosa
+
+    print("\nBuilding melody-clean version (mute target words + remix)...")
+
+    vocals       = AudioSegment.from_wav(str(vocals_path))
+    accompaniment = AudioSegment.from_wav(str(no_vocals_path))
+
+    if not replacements:
+        print("  No target words found — remixing as-is.")
+        min_len = min(len(vocals), len(accompaniment))
+        return accompaniment[:min_len].overlay(vocals[:min_len])
+
+    vocals_np, vocals_sr = librosa.load(str(vocals_path), sr=None, mono=True)
+
+    # Long musical fades when word list is available; short anti-click fades otherwise
+    FADE_OUT_MS = 1000 if words else 30
+    FADE_IN_MS  = 1000 if words else 30
+
+    for r in replacements:
+        snapped_start = _snap_to_onset(vocals_np, vocals_sr, r["start"])
+        snapped_end   = _snap_to_onset(vocals_np, vocals_sr, r["end"])
+
+        start_ms = int(snapped_start * 1000)
+        end_ms   = int(snapped_end   * 1000)
+
+        pad        = 80  # ms — same pad used in build_clean_audio
+        mute_start = max(0, start_ms - pad)
+        mute_end   = min(len(vocals), end_ms + pad)
+        mute_dur   = mute_end - mute_start
+
+        print(f"  [{snapped_start:.2f}s-{snapped_end:.2f}s] Removing \"{r['original']}\"")
+
+        silence = AudioSegment.silent(duration=mute_dur,
+                                      frame_rate=vocals.frame_rate).set_channels(
+                                          vocals.channels).set_sample_width(vocals.sample_width)
+
+        before = vocals[:mute_start]
+        after  = vocals[mute_end:]
+
+        # Fade-out trailing into the gap; fade-in leading out of the gap
+        before = _apply_eq_power_fade(before, FADE_OUT_MS, fade_in=False)
+        after  = _apply_eq_power_fade(after,  FADE_IN_MS,  fade_in=True)
+
+        vocals = before + silence + after
+
+    print("  Remixing with accompaniment...")
+    min_len = min(len(vocals), len(accompaniment))
+    return accompaniment[:min_len].overlay(vocals[:min_len])
+
+
 def save_timestamps(words, path):
     """Cache word timestamps to JSON so --verify skips re-transcription."""
     import json
@@ -1994,27 +2062,152 @@ def replace_words_text(text, pairs):
     return cleaned
 
 
+_MANUAL = """\
+MUSIC AUDIO CLEANER
+
+NAME
+    lyrics_cleaner.py - Remove or replace explicit words in songs
+
+SYNOPSIS
+    python lyrics_cleaner.py <song.mp3> [targetwords.txt] [model_size] [OPTIONS]
+
+DESCRIPTION
+    Automatically removes or replaces specific words in a song's vocals while
+    keeping the original music intact.  Two strategies are available:
+
+    MELODY-CLEAN (recommended, --keep-melody-remove-target)
+        Mutes the target word in the separated vocal track, applies 1-second
+        musical fades on both sides of the gap, and remixes with the original
+        instrumental.  No AI synthesis is used.  Fast — uses cached data when
+        available (~5 seconds if demucs + timestamps already exist).
+
+    WORD REPLACEMENT (default full pipeline)
+        Synthesizes a replacement word using XTTS-v2 voice cloning and
+        SEED-VC voice conversion, then splices it into the original vocals
+        with pitch correction, spectral matching, and seamless crossfades.
+        Results vary — works best on short words with close phonetic matches.
+
+ARGUMENTS
+    song.mp3
+        Path to the input MP3 file.  Organize as:
+        library/Artist/Album/Song/song.mp3
+
+    targetwords.txt  (optional)
+        CSV file with Target and Replace columns.  Defaults to
+        <song_folder>/targetwords.txt, then ./targetwords.txt.
+
+        Format:
+            Target,Replace
+            damn,
+            booty,fun
+            come,
+
+        Replace is optional.  Leave empty for auto-selection.  The system
+        scores candidates on syllable count, stress pattern, and stressed
+        vowel (0-3 points) and picks the best child-friendly match from
+        the CMU Pronouncing Dictionary.
+
+    model_size  (optional, default: base)
+        Whisper ASR model size.  Larger = more accurate timestamps but slower.
+        Choices: tiny  base  small  medium  large
+
+OPTIONS
+    --keep-melody-remove-target
+        Mute target words and remix with instrumental (recommended).
+        Output: <stem>_melody_clean.mp3
+        Fast path: skips Whisper if _timestamps.json + demucs cache exist.
+
+    --verify
+        Re-run the 9-metric quality verification against an existing
+        *_clean.mp3.  No models are loaded; uses cached *_timestamps.json.
+        Metrics: RMS, spectral centroid, rolloff, splice continuity x2,
+        ZCR, MFCC distance, F0 pitch, chroma distance.
+
+    --resing
+        Synthesize the entire song line-by-line in the singer's cloned voice
+        and remix with the instrumental.
+        WARNING: Voice clone quality is poor — the output does not sound like
+        the original artist.  Kept for research purposes only.
+        Fast path: skips full pipeline if all caches exist.
+
+    --manual
+        Display this manual page and exit.
+
+OUTPUT FILES
+    All outputs are written to the song folder alongside the input MP3.
+
+    <stem>_melody_clean.mp3    Target word muted, 1s fades, full remix
+    <stem>_clean.mp3           Voice-replacement version (full pipeline)
+    <stem>_original.txt        Original lyrics transcript (Whisper)
+    <stem>_cleaned.txt         Lyrics with target words substituted
+    <stem>_vocals_clean.wav    Cleaned isolated vocals (used by --verify)
+    <stem>_timestamps.json     Cached Whisper word timestamps
+    demucs_output/*/vocals.wav    Separated vocals (cached)
+    demucs_output/*/no_vocals.wav Separated instrumental (cached)
+    cloned_voice/voice_reference.wav  30s voice clone reference (cached)
+    logs/terminal_DATE_TIME.log       Timestamped session log
+
+CACHING
+    The pipeline caches heavyweight outputs so repeat runs are fast.
+    Delete the relevant file to force re-generation:
+
+    _timestamps.json            Re-runs Whisper transcription
+    demucs_output/              Re-runs vocal separation
+    cloned_voice/               Re-extracts voice sample
+
+REQUIREMENTS
+    Python 3.10+, ffmpeg, CUDA GPU (recommended)
+    Install dependencies:  pip install -r requirements.txt
+    Note: transformers==4.44.2 is pinned — do not upgrade.
+
+FIRST-RUN DOWNLOADS
+    XTTS-v2 (Coqui TTS)    ~1.8 GB    stored in checkpoints/
+    SEED-VC + CampPlus     ~500 MB    stored in checkpoints/
+    Whisper base           ~140 MB    Hugging Face cache
+    Demucs htdemucs         ~80 MB    Torch hub cache
+
+EXAMPLES
+    # Melody-clean (fast, recommended)
+    python lyrics_cleaner.py "library/Artist/Album/Song/song.mp3" --keep-melody-remove-target
+
+    # Full word-replacement pipeline
+    python lyrics_cleaner.py "library/Artist/Album/Song/song.mp3"
+
+    # Use a more accurate Whisper model
+    python lyrics_cleaner.py "song.mp3" targetwords.txt small
+
+    # Re-verify existing clean file
+    python lyrics_cleaner.py "song.mp3" --verify
+
+LICENSE
+    GNU General Public License v2.0 or later (GPL-2.0-or-later).
+    See LICENSE file or https://www.gnu.org/licenses/old-licenses/gpl-2.0.txt
+"""
+
+
 def main():
     print(f"Logging to: {_log_path}")
 
     args = sys.argv[1:]
-    verify_mode = "--verify" in args
-    resing_mode = "--resing" in args
-    args = [a for a in args if a not in ("--verify", "--resing")]
+
+    if "--manual" in args:
+        print(_MANUAL)
+        sys.exit(0)
+
+    verify_mode       = "--verify" in args
+    resing_mode       = "--resing" in args
+    melody_clean_mode = "--keep-melody-remove-target" in args
+    args = [a for a in args if a not in ("--verify", "--resing", "--keep-melody-remove-target")]
 
     if not args:
-        print("Usage: python lyrics_cleaner.py <song.mp3> [targetwords.txt] [model_size] [--verify] [--resing]")
+        print("Usage: python lyrics_cleaner.py <song.mp3> [targetwords.txt] [model_size] [OPTIONS]")
         print()
-        print("  song.mp3         Path to the original MP3 file")
-        print("  targetwords.txt  Optional path to target words CSV")
-        print("                   Default: <song_folder>/targetwords.txt, then ./targetwords.txt")
-        print("  model_size       Whisper model: tiny, base, small, medium, large (default: base)")
-        print("  --verify         Re-run only the 10-metric verification against an existing")
-        print("                   *_clean.mp3 (uses cached *_timestamps.json — no models loaded)")
-        print("  --resing         Also synthesize the full song in the singer's cloned voice")
+        print("  --keep-melody-remove-target  Mute target words + remix (recommended, fast)")
+        print("  --verify                     Re-run quality verification, no models loaded")
+        print("  --resing                     Synthesize full song in cloned voice (experimental)")
+        print("  --manual                     Show full manual page and exit")
         print()
-        print("Folder layout: organize your library as Artist/Album/Song/<song>.mp3")
-        print("  Each song folder can contain its own targetwords.txt and optional official_lyrics.txt")
+        print("Folder layout: library/Artist/Album/Song/<song>.mp3")
         sys.exit(1)
 
     mp3_path = Path(args[0])
@@ -2079,6 +2272,29 @@ def main():
 
         print("\nCached files not complete — running full pipeline first to generate them.")
 
+    # --keep-melody-remove-target fast path: only timestamps + demucs needed,
+    # no TTS or voice cloning required.
+    if melody_clean_mode:
+        vocals_path_check    = song_dir / "demucs_output" / stem / "vocals.wav"
+        no_vocals_path_check = song_dir / "demucs_output" / stem / "no_vocals.wav"
+
+        if (timestamps_file.exists()
+                and vocals_path_check.exists() and no_vocals_path_check.exists()):
+            print("\nAll cached files found — running melody-clean only (no TTS).")
+            words_cached = load_timestamps(timestamps_file)
+            replacements_cached = find_target_words(words_cached, pairs)
+            melody_mix = build_melody_clean(
+                replacements_cached, vocals_path_check, no_vocals_path_check,
+                words=words_cached
+            )
+            melody_mp3 = song_dir / f"{stem}_melody_clean.mp3"
+            print(f"\nExporting melody-clean MP3...")
+            melody_mix.export(str(melody_mp3), format="mp3", bitrate="192k")
+            print(f"Melody-clean MP3: {melody_mp3}")
+            return
+
+        print("\nDemucs cache or timestamps missing — running full pipeline first.")
+
     # Step 1: Transcribe with word timestamps
     lyrics, words = transcribe_with_timestamps(mp3_path, model_size)
 
@@ -2137,6 +2353,7 @@ def main():
     cleaned_txt_file   = song_dir / f"{stem}_cleaned.txt"
     cleaned_mp3        = song_dir / f"{stem}_clean.mp3"
     cleaned_vocals_wav = song_dir / f"{stem}_vocals_clean.wav"
+    melody_mp3         = song_dir / f"{stem}_melody_clean.mp3"
 
     original_txt.write_text(lyrics, encoding="utf-8")
     cleaned_txt_file.write_text(cleaned_text, encoding="utf-8")
@@ -2147,15 +2364,21 @@ def main():
     # Save isolated vocals sidecar so --verify can do accurate F0 checks
     cleaned_vocals.export(str(cleaned_vocals_wav), format="wav")
 
+    # Step 6: Melody-clean version — mute target words, remix (always produced)
+    melody_mix = build_melody_clean(replacements, vocals_path, no_vocals_path, words=words)
+    print(f"\nExporting melody-clean MP3...")
+    melody_mix.export(str(melody_mp3), format="mp3", bitrate="192k")
+
     print()
     print("=" * 60)
     print("DONE")
     print("=" * 60)
-    print(f"Song folder:     {song_dir}")
-    print(f"Original lyrics: {original_txt}")
-    print(f"Cleaned lyrics:  {cleaned_txt_file}")
-    print(f"Cleaned MP3:     {cleaned_mp3}")
-    print(f"Voice clone:     {voice_ref_path}")
+    print(f"Song folder:       {song_dir}")
+    print(f"Original lyrics:   {original_txt}")
+    print(f"Cleaned lyrics:    {cleaned_txt_file}")
+    print(f"Cleaned MP3:       {cleaned_mp3}")
+    print(f"Melody-clean MP3:  {melody_mp3}")
+    print(f"Voice clone:       {voice_ref_path}")
 
     # Optional: re-sing the full song in the cloned voice
     if resing_mode:
